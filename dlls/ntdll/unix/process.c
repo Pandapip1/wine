@@ -527,6 +527,17 @@ NTSTATUS unixcall_wine_spawnvp( void *args )
 }
 
 
+/***********************************************************************
+ *           unixcall_clone_process
+ */
+NTSTATUS unixcall_clone_process( void *args )
+{
+    struct clone_process_params *params = args;
+
+    return clone_process( params->flags, params->process_handle, params->thread_handle, params->client_id );
+}
+
+
 #ifdef _WIN64
 /***********************************************************************
  *		wow64_wine_spawnvp

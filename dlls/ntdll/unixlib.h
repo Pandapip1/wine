@@ -53,6 +53,14 @@ struct wine_spawnvp_params
     int          wait;
 };
 
+struct clone_process_params
+{
+    ULONG      flags;           /* in: RTL_CLONE_PROCESS_FLAGS_* */
+    HANDLE    *process_handle;  /* out, parent branch only: handle to the clone */
+    HANDLE    *thread_handle;   /* out, parent branch only: handle to its suspended initial thread */
+    CLIENT_ID *client_id;       /* out, parent branch only: its process/thread id */
+};
+
 struct load_so_dll_params
 {
     UNICODE_STRING              nt_name;
@@ -76,6 +84,7 @@ enum ntdll_unix_funcs
     unix_wine_server_handle_to_fd,
     unix_wine_spawnvp,
     unix_system_time_precise,
+    unix_clone_process,
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

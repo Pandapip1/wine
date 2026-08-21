@@ -285,6 +285,7 @@ extern void DECLSPEC_NORETURN abort_thread( int status );
 extern void DECLSPEC_NORETURN abort_process( int status );
 extern void DECLSPEC_NORETURN exit_process( int status );
 extern void wait_suspend( CONTEXT *context );
+extern NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_handle, CLIENT_ID *client_id );
 extern NTSTATUS send_debug_event( struct thread_data *data, EXCEPTION_RECORD *rec,
                                   CONTEXT *context, BOOL first_chance, BOOL exception );
 extern NTSTATUS set_thread_context( HANDLE handle, const void *context, BOOL *self, USHORT machine );
@@ -400,12 +401,14 @@ extern NTSTATUS unixcall_wine_server_call( void *args );
 extern NTSTATUS unixcall_wine_server_fd_to_handle( void *args );
 extern NTSTATUS unixcall_wine_server_handle_to_fd( void *args );
 extern NTSTATUS unixcall_wine_spawnvp( void *args );
+extern NTSTATUS unixcall_clone_process( void *args );
 #ifdef _WIN64
 extern NTSTATUS wow64_wine_dbg_write( void *args );
 extern NTSTATUS wow64_wine_server_call( void *args );
 extern NTSTATUS wow64_wine_server_fd_to_handle( void *args );
 extern NTSTATUS wow64_wine_server_handle_to_fd( void *args );
 extern NTSTATUS wow64_wine_spawnvp( void *args );
+extern NTSTATUS wow64_clone_process( void *args );
 #endif
 
 extern void dbg_init(void);

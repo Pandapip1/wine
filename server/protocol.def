@@ -1170,6 +1170,29 @@ typedef volatile struct
 @END
 
 
+/* Create a process object and a suspended initial thread for
+ * RtlCloneUserProcess: unlike new_process, this duplicates the calling
+ * process's own already-known image and entire handle table, rather than
+ * taking a new image and building a fresh one -- there is no new image,
+ * the clone is going to keep running the one already mapped, and no
+ * partial handle list either: a clone always inherits everything, the way
+ * a real fork() always does, regardless of what RTL_CLONE_PROCESS_FLAGS_*
+ * the RtlCloneUserProcess caller asked for. The actual address-space
+ * duplication happens client-side, by the caller's own fork(); this
+ * request only creates the wineserver-side objects the forked child binds
+ * to via init_first_thread on the new socket, the same request an
+ * ordinarily created process's own initial thread uses. */
+@REQ(clone_process)
+    unsigned int flags;          /* PROCESS_CREATE_FLAGS_* -- always just INHERIT_HANDLES, set by the client */
+    int          socket_fd;      /* file descriptor for the new process's socket */
+@REPLY
+    process_id_t pid;            /* process id of the clone */
+    obj_handle_t process_handle; /* process handle (in the current process) */
+    obj_handle_t thread_handle;  /* handle to the clone's suspended initial thread (in the current process) */
+    thread_id_t  tid;            /* thread id of the clone's initial thread */
+@END
+
+
 /* Retrieve the new process startup info */
 @REQ(get_startup_info)
 @REPLY

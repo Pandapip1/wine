@@ -547,6 +547,7 @@
 @ stdcall RtlClearAllBits(ptr)
 @ stdcall RtlClearBits(ptr long long)
 # @ stub RtlCloneMemoryStream
+@ stdcall RtlCloneUserProcess(long ptr ptr long ptr)
 @ stub RtlClosePropertySet
 # @ stub RtlCommitMemoryStream
 @ stdcall RtlCompactHeap(long long)

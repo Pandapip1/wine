@@ -1172,6 +1172,35 @@ struct new_thread_reply
 };
 
 
+/* Create a process object and a suspended initial thread for
+ * RtlCloneUserProcess: unlike new_process, this duplicates the calling
+ * process's own already-known image and entire handle table, rather than
+ * taking a new image and building a fresh one -- there is no new image,
+ * the clone is going to keep running the one already mapped, and no
+ * partial handle list either: a clone always inherits everything, the way
+ * a real fork() always does, regardless of what RTL_CLONE_PROCESS_FLAGS_*
+ * the RtlCloneUserProcess caller asked for. The actual address-space
+ * duplication happens client-side, by the caller's own fork(); this
+ * request only creates the wineserver-side objects the forked child binds
+ * to via init_first_thread on the new socket, the same request an
+ * ordinarily created process's own initial thread uses. */
+struct clone_process_request
+{
+    struct request_header __header;
+    unsigned int flags;
+    int          socket_fd;
+    char __pad_20[4];
+};
+struct clone_process_reply
+{
+    struct reply_header __header;
+    process_id_t pid;
+    obj_handle_t process_handle;
+    obj_handle_t thread_handle;
+    thread_id_t  tid;
+};
+
+
 
 struct get_startup_info_request
 {
@@ -6248,6 +6277,7 @@ enum request
     REQ_new_process,
     REQ_get_new_process_info,
     REQ_new_thread,
+    REQ_clone_process,
     REQ_get_startup_info,
     REQ_init_process_done,
     REQ_init_first_thread,
@@ -6563,6 +6593,7 @@ union generic_request
     struct new_process_request new_process_request;
     struct get_new_process_info_request get_new_process_info_request;
     struct new_thread_request new_thread_request;
+    struct clone_process_request clone_process_request;
     struct get_startup_info_request get_startup_info_request;
     struct init_process_done_request init_process_done_request;
     struct init_first_thread_request init_first_thread_request;
@@ -6876,6 +6907,7 @@ union generic_reply
     struct new_process_reply new_process_reply;
     struct get_new_process_info_reply get_new_process_info_reply;
     struct new_thread_reply new_thread_reply;
+    struct clone_process_reply clone_process_reply;
     struct get_startup_info_reply get_startup_info_reply;
     struct init_process_done_reply init_process_done_reply;
     struct init_first_thread_reply init_first_thread_reply;
@@ -7183,6 +7215,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 961
+#define SERVER_PROTOCOL_VERSION 963
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

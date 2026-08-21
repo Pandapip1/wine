@@ -544,6 +544,48 @@ NTSTATUS WINAPI RtlCreateUserProcess( UNICODE_STRING *path, ULONG attributes,
                                 &create_info, attr );
 }
 
+
+/******************************************************************************
+ *           RtlCloneUserProcess  (NTDLL.@)
+ *
+ * Clones the calling process: unlike RtlCreateUserProcess/NtCreateUserProcess
+ * above, there is no new image -- the clone keeps running the one already
+ * mapped, the way POSIX fork() does. Real address-space duplication happens
+ * unix-side, by the caller's own fork(); see dlls/ntdll/unix/server.c's
+ * clone_process for the wineserver protocol and what it does and does not
+ * implement (in particular: single-threaded callers only, and the returned
+ * process/thread handles are the only output this fills in -- ImageInformation
+ * is left zeroed rather than queried back out of the still-running image,
+ * since no caller this was written for reads it).
+ *
+ * process_descr, thread_descr and debug_port are accepted for signature
+ * compatibility but not implemented: nothing above this ever passes anything
+ * but NULL for any of the three.
+ *
+ * Returns STATUS_SUCCESS in the calling (parent) process, with info->Process/
+ * Thread/ClientId filled in and the clone's initial thread suspended until
+ * NtResumeThread is called on info->Thread; returns STATUS_PROCESS_CLONED in
+ * the clone itself, once that happens, with info left zeroed there.
+ */
+NTSTATUS WINAPI RtlCloneUserProcess( ULONG process_flags, SECURITY_DESCRIPTOR *process_descr,
+                                     SECURITY_DESCRIPTOR *thread_descr, HANDLE debug_port,
+                                     RTL_USER_PROCESS_INFORMATION *info )
+{
+    struct clone_process_params params;
+    NTSTATUS status;
+
+    memset( info, 0, sizeof(*info) );
+    params.flags          = process_flags;
+    params.process_handle = &info->Process;
+    params.thread_handle  = &info->Thread;
+    params.client_id       = &info->ClientId;
+
+    status = WINE_UNIX_CALL( unix_clone_process, &params );
+    if (status == STATUS_SUCCESS) info->Length = sizeof(*info);
+    return status;
+}
+
+
 /***********************************************************************
  *      DbgUiGetThreadDebugObject (NTDLL.@)
  */

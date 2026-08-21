@@ -1349,6 +1349,114 @@ DECL_HANDLER(new_process)
     release_object( info );
 }
 
+/* create a process object and a suspended initial thread for RtlCloneUserProcess --
+ * see this request's own comment in protocol.def for what makes it different
+ * from new_process/new_thread: there is no new image, so this duplicates the
+ * calling process's own already-known image, startup info and handle table
+ * instead of building fresh ones from a new_process request's wire data. */
+DECL_HANDLER(clone_process)
+{
+    struct process *parent = current->process;
+    struct process *process = NULL;
+    struct thread *thread = NULL;
+    int socket_fd = thread_get_inflight_fd( current, req->socket_fd );
+
+    if (socket_fd == -1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (fcntl( socket_fd, F_SETFL, O_NONBLOCK ) == -1)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        close( socket_fd );
+        return;
+    }
+    if (shutdown_stage)
+    {
+        set_error( STATUS_SHUTDOWN_IN_PROGRESS );
+        close( socket_fd );
+        return;
+    }
+    /* parent->startup_info only lives for the duration of the parent's own
+     * startup (set_process_startup_state releases it once that's done, see
+     * its own comment in process.h) -- long gone by the time a real, running
+     * process calls RtlCloneUserProcess, so there is nothing to borrow it
+     * for. Nor is there anything to borrow it FOR: create_process only reads
+     * its info_data argument for std_handles, and only when handles is
+     * non-NULL (copy_handle_table, called from the handles-NULL branch
+     * below, never looks at std_handles at all) -- a zeroed local one is
+     * exactly as good as the parent's real one would have been. The clone
+     * simply runs without a startup_info of its own (get_process_startup_
+     * info_size answers 0 for it, same as create_process's own !parent
+     * branch), which nothing in this path or the client side ever reads. */
+    {
+        static const struct startup_info_data empty_info;
+
+        if (!(process = create_process( socket_fd, parent, req->flags, &empty_info,
+                                        NULL, NULL, 0, NULL )))
+            return;
+    }
+
+    /* everything else about this process is what the parent's already is:
+     * same image, same PEB address (real address-space duplication is the
+     * caller's own fork(), not this request). */
+    process->machine        = parent->machine;
+    process->imagelen       = parent->imagelen;
+    if (parent->image) process->image = memdup( parent->image, parent->imagelen );
+    process->image_info     = parent->image_info;
+    process->peb            = parent->peb;
+    process->affinity       = parent->affinity;
+    process->priority       = parent->priority;
+    process->base_priority  = parent->base_priority;
+    /* process->winstation/desktop/console are deliberately left at their
+     * create_process defaults (0/0/NULL), not copied from the parent: they
+     * are either object pointers or handle numbers only meaningful once
+     * properly registered (connect_process_winstation, which new_process
+     * calls and this does not), not values it's safe to just copy -- and
+     * in the desktop/winstation case, not even guaranteed to still mean
+     * the same thing in the clone's own handle table, since only handles
+     * marked inheritable survive the copy above at all. Nothing in this
+     * project's own callers (stage0-pe32, GNU Mes) uses any window-station,
+     * desktop or console-object API against a clone, only plain reads/
+     * writes on handles the copy above already inherited, so getting real
+     * sharing right for any of the three is out of scope here. */
+    process->startup_state  = STARTUP_DONE;  /* continuing, not starting up */
+
+    if (!(thread = create_thread( -1, process, NULL ))) goto done;
+    /* always suspended, regardless of the caller's flags: measured against
+     * real Windows 11, a clone's initial thread never runs until the parent
+     * calls NtResumeThread on it, whether or not RTL_CLONE_PROCESS_FLAGS_
+     * CREATE_SUSPENDED was requested -- see stage0-pe32/M2libc's own
+     * x86/windows/process.c, __clone_process's comment above its call. */
+    thread->suspend++;
+    add_process_thread( process, thread );
+
+    reply->pid = get_process_id( process );
+    reply->tid = get_thread_id( thread );
+    if ((reply->process_handle = alloc_handle_no_access_check( current->process, process,
+                                                                PROCESS_ALL_ACCESS, 0 )))
+    {
+        if ((reply->thread_handle = alloc_handle_no_access_check( current->process, thread,
+                                                                    THREAD_ALL_ACCESS, 0 )))
+        {
+            /* thread and process, like new_thread's and new_process's own,
+             * are released when they die (kill_thread/process_destroy), not
+             * here -- alloc_handle_no_access_check's own reference is what
+             * a plain release_object here would wrongly be dropping. */
+            return;
+        }
+        close_handle( current->process, reply->process_handle );
+    }
+    /* a handle didn't allocate: nothing else will ever kill this thread,
+     * so this has to. */
+    kill_thread( thread, 1 );
+    return;
+
+done:
+    release_object( process );
+}
+
 /* Retrieve information about a newly started process */
 DECL_HANDLER(get_new_process_info)
 {

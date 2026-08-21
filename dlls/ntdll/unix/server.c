@@ -1739,6 +1739,189 @@ size_t server_init_process(void)
 
 
 /***********************************************************************
+ *           clone_process
+ *
+ * The unix side of RtlCloneUserProcess: ask wineserver for a new process
+ * and a suspended initial thread that duplicate this one, fork(), and have
+ * the child bind itself to those new objects over its own dedicated
+ * connection -- everything server_init_process does for a brand new
+ * process's first thread above, except there is no new image to load:
+ * fork() already gave the child this exact address space (code, globals,
+ * heap, PEB and all), so there is nothing left to set up beyond the
+ * wineserver-side bookkeeping. See clone_process's own comment in
+ * protocol.def for what the server handler does with its half.
+ *
+ * Only the calling thread survives into the child, exactly like a plain
+ * POSIX fork() -- Wine's own per-thread bookkeeping for any OTHER thread
+ * the parent had (nb_threads, the TEB list, TLS/FLS callback state) is left
+ * stale in the child, same as it would be after a real fork(). Every
+ * caller this was written for (stage0-pe32, GNU Mes) only ever calls this
+ * from a single thread, so that gap is never exercised; a multithreaded
+ * caller is not supported.
+ *
+ * The child blocks in wait_suspend -- the same call an ordinary
+ * CREATE_SUSPENDED thread blocks in before ever running its entry point --
+ * until the parent calls NtResumeThread on the thread handle it gets back.
+ * This happens unconditionally, regardless of the flags passed in,
+ * matching what RtlCloneUserProcess measures on real Windows 11 (see
+ * stage0-pe32/M2libc's own x86/windows/process.c, __clone_process's
+ * comment above its own call). The CONTEXT wait_suspend reports for that
+ * block is a zeroed placeholder, not this thread's real register state:
+ * GetThreadContext against a still-suspended clone, or SetThreadContext
+ * retargeting where it resumes, are both unsupported here.
+ */
+NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_handle, CLIENT_ID *client_id )
+{
+    struct thread_data *data = get_thread_data();
+    int socketfd[2] = { -1, -1 };
+    unsigned int status;
+    obj_handle_t process_obj = 0, thread_obj = 0;
+    process_id_t new_pid = 0;
+    thread_id_t new_tid = 0;
+    pid_t fork_pid;
+
+    if (socketpair( PF_UNIX, SOCK_STREAM, 0, socketfd ) == -1) return STATUS_TOO_MANY_OPENED_FILES;
+#ifdef SO_PASSCRED
+    {
+        int enable = 1;
+        setsockopt( socketfd[0], SOL_SOCKET, SO_PASSCRED, &enable, sizeof(enable) );
+    }
+#endif
+    wine_server_send_fd( socketfd[1] );
+
+    SERVER_START_REQ( clone_process )
+    {
+        /* PROCESS_CREATE_FLAGS_INHERIT_HANDLES, not the caller's own
+         * RTL_CLONE_PROCESS_FLAGS_* `flags` (different namespace, and not
+         * always the same bit) -- a clone always inherits the whole handle
+         * table, the same way a real fork() always does, regardless of
+         * what the RtlCloneUserProcess caller asked for. */
+        req->flags     = PROCESS_CREATE_FLAGS_INHERIT_HANDLES;
+        req->socket_fd  = socketfd[1];
+        if (!(status = wine_server_call( req )))
+        {
+            process_obj = reply->process_handle;
+            thread_obj  = reply->thread_handle;
+            new_pid     = reply->pid;
+            new_tid     = reply->tid;
+        }
+    }
+    SERVER_END_REQ;
+    close( socketfd[1] );
+
+    if (status)
+    {
+        close( socketfd[0] );
+        return status;
+    }
+
+    if ((fork_pid = fork()) == -1)
+    {
+        /* the two objects wineserver already made leak here -- fork()
+         * failing at all is rare enough (and this whole call already
+         * failing along with it) that it isn't worth another round trip
+         * to close them. */
+        close( socketfd[0] );
+        return STATUS_NO_MEMORY;
+    }
+
+    if (fork_pid)  /* parent */
+    {
+        close( socketfd[0] );
+        *process_handle = wine_server_ptr_handle( process_obj );
+        *thread_handle  = wine_server_ptr_handle( thread_obj );
+        *client_id = make_client_id( new_pid, new_tid );
+        return STATUS_SUCCESS;
+    }
+
+    /* child: the two handles above are meaningless here (a different
+     * process's handle table) -- nothing to close, they were never valid
+     * in this address space's handle table to begin with. */
+    {
+        CONTEXT context;
+        obj_handle_t version;
+        int reply_pipe;
+        unsigned int ret;
+        WOW_TEB *wow_teb = get_wow_teb( data->teb );
+
+        /* the old connection and this thread's old per-thread pipes are the
+         * parent's -- inherited by fork() as live fds, but pointing at
+         * conversations the parent is still having, so they get closed
+         * rather than reused; init_thread_pipe below replaces the pipes. */
+        close( fd_socket );
+        fd_socket = socketfd[0];
+        close( data->request_fd );
+        close( data->reply_fd );
+        close( data->wait_fd[0] );
+        close( data->wait_fd[1] );
+
+        /* wine_server_send_fd (called from init_thread_pipe just below)
+         * tags every fd it sends with GetCurrentThreadId() -- which, built
+         * WINE_UNIX_LIB as this file is, reads get_thread_data()->tid
+         * directly (see PsGetCurrentThreadId, ntdll/unix/env.c, and the
+         * #define in include/processthreadsapi.h), not the TEB. data->tid
+         * still carries the PARENT's real tid, inherited byte-for-byte
+         * across fork(). Left alone, the server looks up that tid, finds
+         * the parent's own (unrelated, still very much alive) thread
+         * object, sees it belongs to the wrong process, and drops the fd
+         * ("bad thread id") -- measured directly, the first time this code
+         * ran. A genuinely new process has none of this: its thread_data
+         * is freshly allocated with tid unset (0), and zero tells the
+         * server's receiving end (server/request.c's receive_fd) to route
+         * the fd to "this process's only thread" instead of looking up a
+         * tid at all -- exactly right, since create_thread already made
+         * sure that's true moments ago in clone_process's own wineserver
+         * handler. Zeroing tid here, before the first send, buys the clone
+         * that same fallback; the reply handler below sets it to the real
+         * value once init_first_thread hands it back, and set_thread_id
+         * copies that into the TEB fields other code (PE-side
+         * GetCurrentThreadId, GetCurrentProcessId) actually reads. */
+        data->tid = 0;
+        data->teb->ClientId.UniqueProcess = 0;
+        data->teb->ClientId.UniqueThread  = 0;
+        data->teb->RealClientId = data->teb->ClientId;
+        if (wow_teb)
+        {
+            wow_teb->ClientId.UniqueProcess = 0;
+            wow_teb->ClientId.UniqueThread  = 0;
+            wow_teb->RealClientId = wow_teb->ClientId;
+        }
+
+        data->request_fd = wine_server_receive_fd( &version );
+        if (version != SERVER_PROTOCOL_VERSION)
+            server_protocol_error( "clone: version mismatch %d/%d\n", version, SERVER_PROTOCOL_VERSION );
+
+        reply_pipe = init_thread_pipe( data );
+
+        SERVER_START_REQ( init_first_thread )
+        {
+            req->unix_pid    = getpid();
+            req->unix_tid    = get_unix_tid();
+            req->reply_fd    = reply_pipe;
+            req->wait_fd     = data->wait_fd[1];
+            req->debug_level = (TRACE_ON(server) != 0);
+            req->page_size   = get_host_page_size();
+            wine_server_set_reply( req, supported_machines, sizeof(supported_machines) );
+            if (!(ret = wine_server_call( req )))
+            {
+                pid       = reply->pid;
+                data->tid = reply->tid;
+            }
+        }
+        SERVER_END_REQ;
+        close( reply_pipe );
+        if (ret) server_protocol_error( "clone: init_first_thread failed with status %x\n", ret );
+        set_thread_id( data );
+
+        memset( &context, 0, sizeof(context) );
+        wait_suspend( &context );
+    }
+
+    return STATUS_PROCESS_CLONED;
+}
+
+
+/***********************************************************************
  *           server_init_process_done
  */
 void server_init_process_done(void)
@@ -2058,6 +2241,37 @@ NTSTATUS wow64_wine_server_handle_to_fd( void *args )
 
     return wine_server_handle_to_fd( ULongToHandle( params32->handle ), params32->access,
                                      ULongToPtr( params32->unix_fd ), ULongToPtr( params32->options ));
+}
+
+/**********************************************************************
+ *           wow64_clone_process
+ */
+NTSTATUS wow64_clone_process( void *args )
+{
+    struct
+    {
+        ULONG flags;
+        ULONG process_handle;
+        ULONG thread_handle;
+        ULONG client_id;
+    } const *params32 = args;
+
+    ULONG *process_handle32 = ULongToPtr( params32->process_handle );
+    ULONG *thread_handle32 = ULongToPtr( params32->thread_handle );
+    CLIENT_ID32 *client_id32 = ULongToPtr( params32->client_id );
+    HANDLE process_handle, thread_handle;
+    CLIENT_ID client_id;
+    NTSTATUS ret;
+
+    ret = clone_process( params32->flags, &process_handle, &thread_handle, &client_id );
+    if (!ret)
+    {
+        *process_handle32 = HandleToULong( process_handle );
+        *thread_handle32  = HandleToULong( thread_handle );
+        client_id32->UniqueProcess = HandleToULong( client_id.UniqueProcess );
+        client_id32->UniqueThread  = HandleToULong( client_id.UniqueThread );
+    }
+    return ret;
 }
 
 #endif /* _WIN64 */
