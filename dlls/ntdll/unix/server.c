@@ -1815,6 +1815,19 @@ NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_hand
         return status;
     }
 
+    /* fork twice, exactly as spawn_process does for a brand new process
+     * (see the fork()/fork() pair and the matching "reap child" waitpid in
+     * dlls/ntdll/unix/process.c) -- the clone has to end up reparented to
+     * init rather than staying a child of the caller, because nothing in a
+     * PE process ever calls waitpid(2): a direct child would linger as a
+     * zombie until the caller itself exited, and wineserver's exit watchdog
+     * (start_sigkill_timer/process_sigkill in server/process.c) probes
+     * liveness with kill(unix_pid, 0), which a zombie answers as "still
+     * running". That kept the clone's process object -- and so its pid,
+     * still resolvable by NtOpenProcess -- alive for the watchdog's whole
+     * escalating-delay ladder, about a second, where a spawned process is
+     * released on the watchdog's first tick. The middle process only forks
+     * and _exit()s: no user code, no Wine teardown, no atexit handlers. */
     if ((fork_pid = fork()) == -1)
     {
         /* the two objects wineserver already made leak here -- fork()
@@ -1827,14 +1840,33 @@ NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_hand
 
     if (fork_pid)  /* parent */
     {
+        pid_t wret;
+        int child_status = 0;
+
+        /* reap the middle process. It is ours alone -- forked here, inside
+         * a syscall the caller is blocked in, and gone before this returns,
+         * so no PE-level waitpid can ever see it. ECHILD (someone else got
+         * there first) is as good as success; only a middle process that
+         * failed its own fork() means there is no clone. */
+        do
+        {
+            wret = waitpid( fork_pid, &child_status, 0 );
+        } while (wret < 0 && errno == EINTR);
+
         close( socketfd[0] );
+        if (wret == fork_pid && (!WIFEXITED( child_status ) || WEXITSTATUS( child_status )))
+            return STATUS_NO_MEMORY;  /* the objects above leak, as on fork() failure */
+
         *process_handle = wine_server_ptr_handle( process_obj );
         *thread_handle  = wine_server_ptr_handle( thread_obj );
         *client_id = make_client_id( new_pid, new_tid );
         return STATUS_SUCCESS;
     }
 
-    /* child: the two handles above are meaningless here (a different
+    if ((fork_pid = fork()))  /* middle process */
+        _exit( fork_pid == -1 );
+
+    /* the clone: the two handles above are meaningless here (a different
      * process's handle table) -- nothing to close, they were never valid
      * in this address space's handle table to begin with. */
     {
