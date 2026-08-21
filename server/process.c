@@ -1440,10 +1440,15 @@ DECL_HANDLER(clone_process)
         if ((reply->thread_handle = alloc_handle_no_access_check( current->process, thread,
                                                                     THREAD_ALL_ACCESS, 0 )))
         {
-            /* thread and process, like new_thread's and new_process's own,
-             * are released when they die (kill_thread/process_destroy), not
-             * here -- alloc_handle_no_access_check's own reference is what
-             * a plain release_object here would wrongly be dropping. */
+            /* the THREAD object, like new_thread's own, is released when the
+             * thread dies: kill_thread drops add_process_thread's grab, and
+             * create_thread's own reference belongs to the thread itself.
+             * create_process's reference, though, belongs to this handler --
+             * new_process drops its own at its "done:" label for exactly the
+             * same reason -- and without this the clone's process object (and
+             * the token and event it holds) outlives the whole session, as
+             * wineserver's DEBUG_OBJECTS dump at shutdown showed. */
+            release_object( process );
             return;
         }
         close_handle( current->process, reply->process_handle );
@@ -1451,7 +1456,6 @@ DECL_HANDLER(clone_process)
     /* a handle didn't allocate: nothing else will ever kill this thread,
      * so this has to. */
     kill_thread( thread, 1 );
-    return;
 
 done:
     release_object( process );
