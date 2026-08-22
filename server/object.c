@@ -139,6 +139,8 @@ void dump_objects(void)
 
 void close_objects(void)
 {
+    release_retired_processes();
+
     /* release the permanent objects */
     for (;;)
     {

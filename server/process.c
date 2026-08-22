@@ -545,6 +545,41 @@ void shutdown_master_socket(void)
     close_master_socket( 2 * -TICKS_PER_SEC );  /* for SIGKILL timeouts */
 }
 
+/* On Windows, a process object (and its pid) can still be opened by CLIENT_ID for a while
+ * after the process has exited and every handle to it has been closed -- the kernel object
+ * outlives the last handle. Emulate this by keeping a bounded number of the most recently
+ * exited processes referenced here, so that get_process_from_id() keeps resolving their pid
+ * instead of the object being destroyed (and its pid freed) immediately. Once evicted from
+ * this list the object reverts to plain refcounting and its pid becomes eligible for reuse
+ * as before.  By then process_killed() has already released everything expensive (handle
+ * table, views, user handles, locks), so a retired entry only costs the process struct
+ * itself, its ptid slot and its exit status. */
+#define MAX_RETIRED_PROCESSES 1024
+static struct process *retired_processes[MAX_RETIRED_PROCESSES];
+static unsigned int retired_process_pos;
+
+static void retain_terminated_process( struct process *process )
+{
+    struct process *old = retired_processes[retired_process_pos];
+
+    retired_processes[retired_process_pos] = (struct process *)grab_object( process );
+    retired_process_pos = (retired_process_pos + 1) % MAX_RETIRED_PROCESSES;
+    if (old) release_object( old );
+}
+
+/* release all the retained terminated processes, on server shutdown */
+void release_retired_processes(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < MAX_RETIRED_PROCESSES; i++)
+    {
+        if (!retired_processes[i]) continue;
+        release_object( retired_processes[i] );
+        retired_processes[i] = NULL;
+    }
+}
+
 /* final cleanup once we are sure a process is really dead */
 static void process_died( struct process *process )
 {
@@ -554,6 +589,7 @@ static void process_died( struct process *process )
         if (!--user_processes && !shutdown_stage && master_socket_timeout != TIMEOUT_INFINITE)
             shutdown_timeout = add_timeout_user( master_socket_timeout, server_shutdown_timeout, NULL );
     }
+    retain_terminated_process( process );
     release_object( process );
     if (!--running_processes && shutdown_stage) close_master_socket( 0 );
 }

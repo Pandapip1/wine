@@ -97,6 +97,7 @@ struct process
 extern unsigned int alloc_ptid( void *ptr );
 extern void free_ptid( unsigned int id );
 extern void *get_ptid_entry( unsigned int id );
+extern void release_retired_processes(void);
 extern struct process *create_process( int fd, struct process *parent, unsigned int flags,
                                        const struct startup_info_data *info,
                                        const struct security_descriptor *sd, const obj_handle_t *handles,
