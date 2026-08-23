@@ -4163,8 +4163,11 @@ struct handle_info
 
 /* Set limit flags on a job */
 @REQ(set_job_limits)
-    obj_handle_t handle;          /* handle to the job */
-    unsigned int limit_flags;     /* new limit flags */
+    obj_handle_t handle;               /* handle to the job */
+    unsigned int limit_flags;          /* new limit flags */
+    unsigned int active_process_limit; /* JOB_OBJECT_LIMIT_ACTIVE_PROCESS: max simultaneous processes */
+    mem_size_t   process_memory_limit; /* JOB_OBJECT_LIMIT_PROCESS_MEMORY: per-process committed-memory cap, bytes */
+    timeout_t    process_time_limit;   /* JOB_OBJECT_LIMIT_PROCESS_TIME: per-process user-mode time cap, 100ns units */
 @END
 
 
@@ -4178,11 +4181,15 @@ struct handle_info
 
 /* Retrieve information about a job */
 @REQ(get_job_info)
-    obj_handle_t handle;          /* handle to the job */
+    obj_handle_t handle;               /* handle to the job */
 @REPLY
-    int total_processes;          /* total count of processes */
-    int active_processes;         /* count of running processes */
-    VARARG(pids,uints);           /* list of active pids */
+    int          total_processes;      /* total count of processes */
+    int          active_processes;     /* count of running processes */
+    unsigned int limit_flags;          /* limit flags currently in effect */
+    unsigned int active_process_limit; /* JOB_OBJECT_LIMIT_ACTIVE_PROCESS value, if set */
+    mem_size_t   process_memory_limit; /* JOB_OBJECT_LIMIT_PROCESS_MEMORY value, if set */
+    timeout_t    process_time_limit;   /* JOB_OBJECT_LIMIT_PROCESS_TIME value, if set */
+    VARARG(pids,uints);                /* list of active pids */
 @END
 
 

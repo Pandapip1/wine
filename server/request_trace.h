@@ -3340,6 +3340,9 @@ static void dump_set_job_limits_request( const struct set_job_limits_request *re
 {
     fprintf( stderr, " handle=%04x", req->handle );
     fprintf( stderr, ", limit_flags=%08x", req->limit_flags );
+    fprintf( stderr, ", active_process_limit=%08x", req->active_process_limit );
+    dump_uint64( ", process_memory_limit=", &req->process_memory_limit );
+    dump_timeout( ", process_time_limit=", &req->process_time_limit );
 }
 
 static void dump_set_job_completion_port_request( const struct set_job_completion_port_request *req )
@@ -3358,6 +3361,10 @@ static void dump_get_job_info_reply( const struct get_job_info_reply *req )
 {
     fprintf( stderr, " total_processes=%d", req->total_processes );
     fprintf( stderr, ", active_processes=%d", req->active_processes );
+    fprintf( stderr, ", limit_flags=%08x", req->limit_flags );
+    fprintf( stderr, ", active_process_limit=%08x", req->active_process_limit );
+    dump_uint64( ", process_memory_limit=", &req->process_memory_limit );
+    dump_timeout( ", process_time_limit=", &req->process_time_limit );
     dump_varargs_uints( ", pids=", cur_size );
 }
 

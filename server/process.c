@@ -160,6 +160,8 @@ static bool job_init( struct object *obj, const void *init_data );
 static struct object *job_get_sync( struct object *obj );
 static int job_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
 static void job_destroy( struct object *obj );
+static void update_job_limit_timer( struct job *job );
+static void disarm_job_limit_timer( struct job *job );
 
 struct job
 {
@@ -169,6 +171,10 @@ struct job
     int                  num_processes;     /* count of running processes */
     int                  total_processes;   /* count of processes which have been assigned */
     unsigned int         limit_flags;       /* limit flags */
+    unsigned int         active_process_limit; /* JOB_OBJECT_LIMIT_ACTIVE_PROCESS value */
+    mem_size_t           process_memory_limit;  /* JOB_OBJECT_LIMIT_PROCESS_MEMORY value, bytes */
+    timeout_t            process_time_limit;    /* JOB_OBJECT_LIMIT_PROCESS_TIME value, 100ns units */
+    struct timeout_user  *limit_timeout;    /* periodic timer polling PROCESS_MEMORY/PROCESS_TIME, when either is set */
     int                  terminating;       /* job is terminating */
     struct completion   *completion_port;   /* associated completion port */
     apc_param_t          completion_key;    /* key to send with completion messages */
@@ -294,6 +300,148 @@ static void add_job_process( struct job *job, struct process *process )
         j->total_processes++;
         add_job_completion( j, JOB_OBJECT_MSG_NEW_PROCESS, pid );
     }
+
+    /* JOBOBJECT_BASIC_LIMIT_INFORMATION.ActiveProcessLimit: "If you try to
+     * associate a process with a job, and this causes the active process
+     * count to exceed this limit, the process is terminated and the
+     * association fails." Checked against the job the process was just
+     * added to directly; a limit set further up a nested chain is not
+     * re-checked here. */
+    if ((job->limit_flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS) &&
+        job->active_process_limit && job->num_processes > (int)job->active_process_limit)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        if (process->running_threads) terminate_process( process, NULL, 1 );
+    }
+
+    update_job_limit_timer( job );
+}
+
+/* JOBOBJECT_BASIC_LIMIT_INFORMATION.PerProcessUserTimeLimit /
+ * JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit: neither has a
+ * single Linux syscall that fires synchronously the instant some other
+ * process crosses the threshold (that would need per-commit/per-tick
+ * accounting hooked into every process in the job), so both are enforced
+ * by periodically sampling each member process's /proc entry and killing
+ * it if it is already over -- the same "system periodically checks"
+ * model the JOBOBJECT_BASIC_LIMIT_INFORMATION.PerProcessUserTimeLimit
+ * documentation itself describes for the time limit; for the memory
+ * limit this is an approximation of the real synchronous per-VirtualAlloc
+ * check (see the accompanying report for what full synchronous
+ * enforcement would require). */
+#define JOB_LIMIT_POLL_INTERVAL (-500000)  /* 50ms, in 100ns units */
+
+static void job_limit_timeout( void *private );
+
+static void arm_job_limit_timer( struct job *job )
+{
+    if (job->limit_timeout || job->terminating) return;
+    if (!(job->limit_flags & (JOB_OBJECT_LIMIT_PROCESS_TIME | JOB_OBJECT_LIMIT_PROCESS_MEMORY))) return;
+    if (list_empty( &job->process_list )) return;
+    job->limit_timeout = add_timeout_user( JOB_LIMIT_POLL_INTERVAL, job_limit_timeout, job );
+}
+
+static void disarm_job_limit_timer( struct job *job )
+{
+    if (!job->limit_timeout) return;
+    remove_timeout_user( job->limit_timeout );
+    job->limit_timeout = NULL;
+}
+
+/* re-evaluate whether the periodic poll needs to run, e.g. after
+ * set_job_limits changes limit_flags or a process joins/leaves the job */
+static void update_job_limit_timer( struct job *job )
+{
+    if (job->limit_flags & (JOB_OBJECT_LIMIT_PROCESS_TIME | JOB_OBJECT_LIMIT_PROCESS_MEMORY))
+        arm_job_limit_timer( job );
+    else
+        disarm_job_limit_timer( job );
+}
+
+#ifdef linux
+/* read /proc/<pid>/stat's utime+stime (fields 14,15, in clock ticks) and
+ * convert to 100ns units, the same units JOBOBJECT_BASIC_LIMIT_INFORMATION
+ * uses for PerProcessUserTimeLimit and KERNEL_USER_TIMES uses elsewhere
+ * in this server for process/thread times. */
+static timeout_t get_unix_process_time( int unix_pid )
+{
+    char proc_path[32], buf[1024];
+    FILE *f;
+    long ticks = sysconf( _SC_CLK_TCK );
+    unsigned long utime = 0, stime = 0;
+    const char *p;
+    int field;
+
+    if (!ticks) return 0;
+    snprintf( proc_path, sizeof(proc_path), "/proc/%u/stat", unix_pid );
+    if (!(f = fopen( proc_path, "r" ))) return 0;
+    if (!fgets( buf, sizeof(buf), f )) { fclose( f ); return 0; }
+    fclose( f );
+
+    /* the second field is "(comm)" and may itself contain spaces/parens;
+     * skip past the last ')' before counting fields from there */
+    p = strrchr( buf, ')' );
+    if (!p) return 0;
+    p++;
+    for (field = 3; field < 14 && *p; field++)
+    {
+        while (*p == ' ') p++;
+        while (*p && *p != ' ') p++;
+    }
+    if (sscanf( p, " %lu %lu", &utime, &stime ) != 2) return 0;
+    return ((timeout_t)utime + stime) * 10000000 / ticks;
+}
+
+static mem_size_t get_unix_process_committed_memory( int unix_pid )
+{
+    char proc_path[32], line[256];
+    unsigned long value;
+    mem_size_t committed = 0;
+    FILE *f;
+
+    snprintf( proc_path, sizeof(proc_path), "/proc/%u/status", unix_pid );
+    if (!(f = fopen( proc_path, "r" ))) return 0;
+    while (fgets( line, sizeof(line), f ))
+    {
+        if (sscanf( line, "RssAnon: %lu", &value ))
+            committed += (mem_size_t)value * 1024;
+        else if (sscanf( line, "VmSwap: %lu", &value ))
+            committed += (mem_size_t)value * 1024;
+    }
+    fclose( f );
+    return committed;
+}
+#else
+static timeout_t get_unix_process_time( int unix_pid ) { return 0; }
+static mem_size_t get_unix_process_committed_memory( int unix_pid ) { return 0; }
+#endif
+
+static void job_limit_timeout( void *private )
+{
+    struct job *job = private;
+    struct process *process, *next;
+
+    job->limit_timeout = NULL;
+
+    LIST_FOR_EACH_ENTRY_SAFE( process, next, &job->process_list, struct process, job_entry )
+    {
+        if (!process->running_threads || process->unix_pid == -1) continue;
+
+        if ((job->limit_flags & JOB_OBJECT_LIMIT_PROCESS_TIME) && job->process_time_limit &&
+            get_unix_process_time( process->unix_pid ) > job->process_time_limit)
+        {
+            terminate_process( process, NULL, 1 );
+            continue;
+        }
+        if ((job->limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) && job->process_memory_limit &&
+            get_unix_process_committed_memory( process->unix_pid ) > job->process_memory_limit)
+        {
+            terminate_process( process, NULL, 1 );
+            continue;
+        }
+    }
+
+    arm_job_limit_timer( job );
 }
 
 /* called when a process has terminated, allow one additional process */
@@ -362,6 +510,8 @@ static void job_destroy( struct object *obj )
     assert( list_empty( &job->process_list ));
     assert( list_empty( &job->child_job_list ));
 
+    disarm_job_limit_timer( job );
+
     if (job->completion_port) release_object( job->completion_port );
     if (job->parent)
     {
@@ -389,6 +539,10 @@ static bool job_init( struct object *obj, const void *init_data )
     job->num_processes = 0;
     job->total_processes = 0;
     job->limit_flags = 0;
+    job->active_process_limit = 0;
+    job->process_memory_limit = 0;
+    job->process_time_limit = 0;
+    job->limit_timeout = NULL;
     job->terminating = 0;
     job->completion_port = NULL;
     job->completion_key = 0;
@@ -1589,6 +1743,26 @@ DECL_HANDLER(init_process_done)
         process->idle_event = create_event( NULL, empty_str, 0, 1, 0, NULL );
     if (process->debug_obj) set_process_debug_flag( process, 1 );
     reply->suspend = (current->suspend || process->suspend);
+
+    /* JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit: the real
+     * synchronous check ("when a process attempts to commit memory that
+     * would exceed the per-process limit, it fails") happens too early in
+     * a process's life -- during its own loader's initial commits, before
+     * it ever reaches here -- for this server to hook without intercepting
+     * every VirtualAlloc in every process in the job (see the report this
+     * change shipped with for what that would take). The periodic poll in
+     * job_limit_timeout() below approximates it for a long-lived process,
+     * but a process that is already over the limit and short-lived (e.g.
+     * it does a small amount of work and exits) can race past a 50ms poll
+     * entirely. This request is the client's own synchronous signal that
+     * its loader has finished its initial commits and it is about to run
+     * real code, so check here too -- catching "already over the limit by
+     * the time the loader is done" reliably, without needing to poll fast
+     * enough to catch every possible process lifetime. */
+    if (process->job && (process->job->limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) &&
+        process->job->process_memory_limit && process->unix_pid != -1 &&
+        get_unix_process_committed_memory( process->unix_pid ) > process->job->process_memory_limit)
+        terminate_process( process, NULL, 1 );
 }
 
 /* open a handle to a process */
@@ -2032,6 +2206,10 @@ DECL_HANDLER(get_job_info)
 
     reply->total_processes = job->total_processes;
     reply->active_processes = job->num_processes;
+    reply->limit_flags = job->limit_flags;
+    reply->active_process_limit = job->active_process_limit;
+    reply->process_memory_limit = job->process_memory_limit;
+    reply->process_time_limit = job->process_time_limit;
 
     len = min( get_reply_max_size(), reply->active_processes * sizeof(*pids) );
     if (len && ((pids = set_reply_data_size( len ))))
@@ -2059,6 +2237,13 @@ DECL_HANDLER(set_job_limits)
     if (!job) return;
 
     job->limit_flags = req->limit_flags;
+    if (req->limit_flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS)
+        job->active_process_limit = req->active_process_limit;
+    if (req->limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY)
+        job->process_memory_limit = req->process_memory_limit;
+    if (req->limit_flags & JOB_OBJECT_LIMIT_PROCESS_TIME)
+        job->process_time_limit = req->process_time_limit;
+    update_job_limit_timer( job );
     release_object( job );
 }
 

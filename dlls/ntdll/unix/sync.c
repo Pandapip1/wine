@@ -1477,7 +1477,7 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
 {
     unsigned int ret;
 
-    TRACE( "semi-stub: %p %u %p %u %p\n", handle, class, info, len, ret_len );
+    TRACE( "(%p, %u, %p, %u, %p)\n", handle, class, info, len, ret_len );
 
     if (class >= MaxJobObjectInfoClass) return STATUS_INVALID_PARAMETER;
 
@@ -1546,8 +1546,20 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
 
         if (len < sizeof(*extended_limit)) return STATUS_INFO_LENGTH_MISMATCH;
         memset( extended_limit, 0, sizeof(*extended_limit) );
+        SERVER_START_REQ( get_job_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(ret = wine_server_call( req )))
+            {
+                extended_limit->BasicLimitInformation.LimitFlags = reply->limit_flags;
+                extended_limit->BasicLimitInformation.ActiveProcessLimit = reply->active_process_limit;
+                extended_limit->BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = reply->process_time_limit;
+                extended_limit->ProcessMemoryLimit = reply->process_memory_limit;
+            }
+        }
+        SERVER_END_REQ;
         if (ret_len) *ret_len = sizeof(*extended_limit);
-        return STATUS_SUCCESS;
+        return ret;
     }
     case JobObjectBasicLimitInformation:
     {
@@ -1555,8 +1567,19 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
 
         if (len < sizeof(*basic_limit)) return STATUS_INFO_LENGTH_MISMATCH;
         memset( basic_limit, 0, sizeof(*basic_limit) );
+        SERVER_START_REQ( get_job_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            if (!(ret = wine_server_call( req )))
+            {
+                basic_limit->LimitFlags = reply->limit_flags;
+                basic_limit->ActiveProcessLimit = reply->active_process_limit;
+                basic_limit->PerProcessUserTimeLimit.QuadPart = reply->process_time_limit;
+            }
+        }
+        SERVER_END_REQ;
         if (ret_len) *ret_len = sizeof(*basic_limit);
-        return STATUS_SUCCESS;
+        return ret;
     }
     default:
         return STATUS_NOT_IMPLEMENTED;
@@ -1591,8 +1614,14 @@ NTSTATUS WINAPI NtSetInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS cla
         if (basic_limit->LimitFlags & ~limit_flags) return STATUS_INVALID_PARAMETER;
         SERVER_START_REQ( set_job_limits )
         {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION *extended_limit =
+                class == JobObjectExtendedLimitInformation ? (JOBOBJECT_EXTENDED_LIMIT_INFORMATION *)info : NULL;
+
             req->handle = wine_server_obj_handle( handle );
             req->limit_flags = basic_limit->LimitFlags;
+            req->active_process_limit = basic_limit->ActiveProcessLimit;
+            req->process_time_limit = basic_limit->PerProcessUserTimeLimit.QuadPart;
+            req->process_memory_limit = extended_limit ? extended_limit->ProcessMemoryLimit : 0;
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
