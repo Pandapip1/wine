@@ -2818,6 +2818,173 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         return;
     }
 
+    /* The real (non-Wine-invented) AFD_CONNECT ioctl. Input is AFD_CONNECT_INFO
+     * followed by a TRANSPORT_ADDRESS holding one TA_ADDRESS, per ReactOS's
+     * shared.h -- see struct afd_connect_info_params in include/wine/afd.h for
+     * the exact byte layout assumed here and the caveat that it is unverified
+     * against real Windows. Unlike IOCTL_AFD_WINE_CONNECT this never pipelines
+     * a send buffer with the connect, and always requires a prior real bind
+     * (IOCTL_AFD_BIND) -- both are design choices made for this prototype, not
+     * confirmed real-Windows behaviour. */
+    case IOCTL_AFD_CONNECT:
+    {
+        const struct afd_connect_info_params *info = get_req_data();
+        const unsigned char *tail;
+        data_size_t tail_size, fixed_tail;
+        LONG addr_count;
+        USHORT addr_len, addr_type;
+        union win_sockaddr win_addr;
+        const struct WS_sockaddr *addr;
+        union unix_sockaddr unix_addr, peer_addr;
+        struct connect_req *req;
+        socklen_t unix_len;
+        int ret;
+
+        fixed_tail = sizeof(LONG) + 2 * sizeof(USHORT);
+        if (get_req_data_size() < sizeof(*info) + fixed_tail)
+        {
+            set_error( STATUS_BUFFER_TOO_SMALL );
+            return;
+        }
+        tail = (const unsigned char *)get_req_data() + sizeof(*info);
+        tail_size = get_req_data_size() - sizeof(*info);
+
+        memcpy( &addr_count, tail, sizeof(addr_count) );
+        memcpy( &addr_len, tail + sizeof(addr_count), sizeof(addr_len) );
+        memcpy( &addr_type, tail + sizeof(addr_count) + sizeof(addr_len), sizeof(addr_type) );
+
+        if (addr_count != 1 || tail_size - fixed_tail < addr_len)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        memset( &win_addr, 0, sizeof(win_addr) );
+        if (addr_type == TDI_ADDRESS_TYPE_IP && addr_len >= 2 + 4)
+        {
+            const unsigned char *p = tail + fixed_tail;
+            win_addr.in.sin_family = WS_AF_INET;
+            memcpy( &win_addr.in.sin_port, p, 2 );
+            memcpy( &win_addr.in.sin_addr, p + 2, 4 );
+            addr = &win_addr.addr;
+        }
+        else if (addr_type == TDI_ADDRESS_TYPE_IP6 && addr_len >= 2 + 4 + 16 + 4)
+        {
+            const unsigned char *p = tail + fixed_tail;
+            win_addr.in6.sin6_family = WS_AF_INET6;
+            memcpy( &win_addr.in6.sin6_port, p, 2 );
+            memcpy( &win_addr.in6.sin6_flowinfo, p + 2, 4 );
+            memcpy( &win_addr.in6.sin6_addr, p + 6, 16 );
+            memcpy( &win_addr.in6.sin6_scope_id, p + 22, 4 );
+            addr = &win_addr.addr;
+        }
+        else
+        {
+            set_error( STATUS_NOT_SUPPORTED );
+            return;
+        }
+
+        if (!sock->bound)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        if (sock->accept_recv_req || sock->connect_req)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+
+        switch (sock->state)
+        {
+            case SOCK_LISTENING:
+                set_error( STATUS_INVALID_PARAMETER );
+                return;
+            case SOCK_CONNECTING:
+                set_error( STATUS_INVALID_PARAMETER );
+                return;
+            case SOCK_CONNECTED:
+                set_error( STATUS_CONNECTION_ACTIVE );
+                return;
+            case SOCK_UNCONNECTED:
+            case SOCK_CONNECTIONLESS:
+                break;
+        }
+
+        unix_len = sockaddr_to_unix( addr, addr_type == TDI_ADDRESS_TYPE_IP ?
+                                      sizeof(win_addr.in) : sizeof(win_addr.in6), &unix_addr );
+        if (!unix_len)
+        {
+            set_error( STATUS_INVALID_ADDRESS );
+            return;
+        }
+        if (sock->state == SOCK_UNCONNECTED)
+        {
+            sock->pending_events &= ~AFD_POLL_CONNECT_ERR;
+            sock->reported_events &= ~AFD_POLL_CONNECT_ERR;
+        }
+        if (unix_addr.addr.sa_family == AF_INET && !memcmp( &unix_addr.in.sin_addr, magic_loopback_addr, 4 ))
+            unix_addr.in.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+
+        memcpy( &peer_addr, &unix_addr, sizeof(unix_addr) );
+        ret = connect( unix_fd, &unix_addr.addr, unix_len );
+        if (ret < 0 && errno == ECONNABORTED)
+            ret = connect( unix_fd, &unix_addr.addr, unix_len );
+
+        if (ret < 0 && errno != EINPROGRESS)
+        {
+            set_error( sock_get_ntstatus( errno ) );
+            return;
+        }
+
+        allow_fd_caching( sock->fd );
+
+        unix_len = sizeof(unix_addr);
+        getsockname( unix_fd, &unix_addr.addr, &unix_len );
+        sock->addr_len = sockaddr_from_unix( &unix_addr, &sock->addr.addr, sizeof(sock->addr) );
+        sock->peer_addr_len = sockaddr_from_unix( &peer_addr, &sock->peer_addr.addr, sizeof(sock->peer_addr) );
+
+        sock->bound = 1;
+
+        if (!ret)
+        {
+            if (sock->type != WS_SOCK_DGRAM)
+            {
+                sock->state = SOCK_CONNECTED;
+                sock->connect_time = current_time;
+            }
+            return;
+        }
+
+        if (sock->type != WS_SOCK_DGRAM)
+            sock->state = SOCK_CONNECTING;
+
+        if (sock->nonblocking)
+        {
+            sock_reselect( sock );
+            set_error( STATUS_DEVICE_NOT_READY );
+            return;
+        }
+
+        if (!(req = mem_alloc( sizeof(*req) )))
+            return;
+
+        req->async = (struct async *)grab_object( async );
+        req->iosb = async_get_iosb( async );
+        req->sock = (struct sock *)grab_object( sock );
+        req->addr_len = addr_type == TDI_ADDRESS_TYPE_IP ? sizeof(win_addr.in) : sizeof(win_addr.in6);
+        req->send_len = 0;
+        req->send_cursor = 0;
+
+        async_set_completion_callback( async, free_connect_req, req );
+        sock->connect_req = req;
+        queue_async( &sock->connect_q, async );
+        sock_reselect( sock );
+        set_error( STATUS_PENDING );
+        return;
+    }
+
     case IOCTL_AFD_WINE_SHUTDOWN:
     {
         unsigned int how;

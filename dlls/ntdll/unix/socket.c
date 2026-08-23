@@ -1628,6 +1628,11 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             break;
         }
 
+        case IOCTL_AFD_CONNECT:
+            /* Handled entirely server-side, like IOCTL_AFD_BIND above. */
+            status = STATUS_BAD_DEVICE_TYPE;
+            break;
+
         case IOCTL_AFD_GETSOCKNAME:
             if (in_size) FIXME( "unexpected input size %u\n", in_size );
 
