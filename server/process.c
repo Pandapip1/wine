@@ -392,24 +392,46 @@ static timeout_t get_unix_process_time( int unix_pid )
     return ((timeout_t)utime + stime) * 10000000 / ticks;
 }
 
+/* Approximates JOBOBJECT_EXTENDED_LIMIT_INFORMATION.ProcessMemoryLimit
+ * ("committed memory") with /proc/<pid>/status's VmRSS. Two other figures
+ * were measured against a real ntlibc test binary and rejected: RssAnon+
+ * VmSwap (anonymous-only) stayed near a few hundred KB even once the
+ * process had finished loading ntdll/kernel32 and was ready to run its
+ * own code, because most of what NT's own loader would count as
+ * committed shows up on Linux as clean file-backed mappings (the PE
+ * image sections, ntdll/kernel32's own .text/.data) rather than private
+ * anonymous pages -- so a limit genuinely lethal on real Windows (down
+ * in the single-digit-MiB range) was silently surviving under Wine.
+ * VmSize (total virtual address space, reserved or not) went too far the
+ * other way: it measured well over a gigabyte for that same trivial
+ * process, entirely from address space Wine and the loader reserve but
+ * never touch, so it also blew past any limit generous enough to let a
+ * real, non-pathological process actually run. VmRSS -- total resident
+ * memory, file-backed and anonymous alike -- landed in between (a few
+ * MiB for a minimal process) and is what is used here: it is large
+ * enough to catch a limit that is genuinely too small to load and start
+ * a process at all, without also flagging every process that merely
+ * reserves address space it never commits. It is still an approximation
+ * of NT's own "committed" bookkeeping, not identical to it -- see the
+ * report this change shipped with. */
 static mem_size_t get_unix_process_committed_memory( int unix_pid )
 {
     char proc_path[32], line[256];
     unsigned long value;
-    mem_size_t committed = 0;
     FILE *f;
 
     snprintf( proc_path, sizeof(proc_path), "/proc/%u/status", unix_pid );
     if (!(f = fopen( proc_path, "r" ))) return 0;
     while (fgets( line, sizeof(line), f ))
     {
-        if (sscanf( line, "RssAnon: %lu", &value ))
-            committed += (mem_size_t)value * 1024;
-        else if (sscanf( line, "VmSwap: %lu", &value ))
-            committed += (mem_size_t)value * 1024;
+        if (sscanf( line, "VmRSS: %lu", &value ))
+        {
+            fclose( f );
+            return (mem_size_t)value * 1024;
+        }
     }
     fclose( f );
-    return committed;
+    return 0;
 }
 #else
 static timeout_t get_unix_process_time( int unix_pid ) { return 0; }
