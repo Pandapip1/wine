@@ -649,6 +649,8 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->machine         = native_machine;
     process->page_size       = get_page_size();
     process->unix_pid        = -1;
+    process->user_time       = 0;
+    process->kernel_time     = 0;
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
     process->user_threads    = 0;
@@ -905,6 +907,56 @@ struct process *get_process_from_handle( obj_handle_t handle, unsigned int acces
                                              access, &process_ops );
 }
 
+/* sample the CPU times of a process from the OS and cache them in the process object.
+ *
+ * The cached values are what NtQueryInformationProcess(ProcessTimes) reports.  They have
+ * to outlive the Unix process, since Win32 requires the times of an exited process to stay
+ * readable through a still-open handle, so they are refreshed here and remembered rather
+ * than read on demand.  This is called while the process is still alive: on every query,
+ * when it is being terminated, and once more when its last thread has gone.
+ *
+ * If the times cannot be obtained the cached values are left alone, and a process whose
+ * times were never sampled keeps reporting zero.  Zero is deliberate: a caller can tell it
+ * apart from a real measurement, whereas substituting some other process's times (as this
+ * used to do, by calling times() on the server or on the caller itself) yields a plausible
+ * number that silently belongs to the wrong process.
+ */
+static void update_process_times( struct process *process )
+{
+#ifdef linux
+    unsigned long clocks_per_sec = sysconf( _SC_CLK_TCK );
+    timeout_t user_time, kernel_time;
+    unsigned long usr, sys;
+    char buf[512], *pos;
+    FILE *f;
+    int i;
+
+    if (process->unix_pid == -1 || !clocks_per_sec) return;
+    snprintf( buf, sizeof(buf), "/proc/%u/stat", process->unix_pid );
+    if (!(f = fopen( buf, "r" ))) return;
+    pos = fgets( buf, sizeof(buf), f );
+    fclose( f );
+
+    /* the process name is printed unescaped, so skip past the last ')' */
+    if (pos) pos = strrchr( pos, ')' );
+    if (pos) pos = strchr( pos + 1, ' ' );
+    /* skip state, ppid, pgid, sid, tty_nr, tty_pgrp, flags, min_flt, cmin_flt,
+     * maj_flt, cmaj_flt; utime and stime follow.  For a thread group leader these
+     * are the totals over all the threads of the process. */
+    for (i = 0; i < 11 && pos; i++) pos = strchr( pos + 1, ' ' );
+    if (!pos || sscanf( pos, "%lu %lu", &usr, &sys ) != 2) return;
+    user_time = (timeout_t)usr * TICKS_PER_SEC / clocks_per_sec;
+    kernel_time = (timeout_t)sys * TICKS_PER_SEC / clocks_per_sec;
+
+    /* CPU times only ever go up.  A sample that goes backwards cannot be this process --
+     * the most likely cause is that it already died and its Unix pid was recycled -- so
+     * keep what we had instead of reporting another process's numbers. */
+    if (user_time < process->user_time || kernel_time < process->kernel_time) return;
+    process->user_time = user_time;
+    process->kernel_time = kernel_time;
+#endif
+}
+
 /* terminate a process with the given exit code */
 static void terminate_process( struct process *process, struct thread *skip, int exit_code )
 {
@@ -912,6 +964,7 @@ static void terminate_process( struct process *process, struct thread *skip, int
 
     grab_object( process );  /* make sure it doesn't get freed when threads die */
     process->is_terminating = 1;
+    update_process_times( process );  /* last chance while the Unix process is certainly alive */
 
 restart:
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
@@ -959,6 +1012,10 @@ void kill_console_processes( struct thread *renderer, int exit_code )
 static void process_killed( struct process *process )
 {
     assert( list_empty( &process->thread_list ));
+    /* best effort: the Unix process is on its way out but is usually still around (that is
+     * what the sigkill timer below polls for), so this picks up whatever it used after the
+     * sample taken when it was terminated.  If it is already gone we keep that sample. */
+    update_process_times( process );
     process->end_time = current_time;
     close_process_desktop( process );
     process->winstation = 0;
@@ -1644,6 +1701,25 @@ DECL_HANDLER(get_process_info)
             if (!process->running_threads) set_error( STATUS_PROCESS_IS_TERMINATING );
             else set_reply_data( &process->image_info, min( sizeof(process->image_info), get_reply_max_size() ));
         }
+        release_object( process );
+    }
+}
+
+/* fetch the CPU times of a process */
+DECL_HANDLER(get_process_times)
+{
+    struct process *process;
+
+    if ((process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION )))
+    {
+        /* refresh from the OS while the process is still alive; once it is gone we report
+         * the last sample taken while it was, which is what Win32 callers expect to keep
+         * seeing through a handle to an exited process. */
+        if (process->running_threads) update_process_times( process );
+        reply->create_time  = process->start_time;
+        reply->exit_time    = process->end_time;
+        reply->user_time    = process->user_time;
+        reply->kernel_time  = process->kernel_time;
         release_object( process );
     }
 }
