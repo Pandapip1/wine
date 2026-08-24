@@ -2812,6 +2812,40 @@ static void set_fd_name( struct fd *fd, struct fd *root, const char *nameptr, da
         /* can't replace directories or special files */
         if (!S_ISREG( st.st_mode ))
         {
+            /* Real NT (NTFS with FILE_RENAME_POSIX_SEMANTICS, the flag
+             * ntlibc's renameat() always sets) answers a rename onto a
+             * non-empty directory with STATUS_DIRECTORY_NOT_EMPTY, not
+             * STATUS_ACCESS_DENIED -- distinguishing that from "old
+             * isn't a directory but new is" (STATUS_OBJECT_NAME_COLLISION
+             * for POSIX semantics; classically EISDIR-shaped) is exactly
+             * what let real Windows CI pass test/posix-unistd.c's
+             * rename-onto-nonempty-dir case without ever exercising
+             * ntlibc's STATUS_ACCESS_DENIED disambiguation fallback (the
+             * one that queries FileBasicInformation on a DELETE-only
+             * handle -- see the FILE_READ_ATTRIBUTES access-check commit
+             * above). Wine used to fold this into the same blanket
+             * ACCESS_DENIED as every other non-regular-file replace,
+             * which forced that fallback and then, with the access check
+             * enforced, denied it -- a real but latent ntlibc bug that
+             * real Windows's modern NTFS just doesn't happen to trigger
+             * here. Match real NT for the case we can safely detect
+             * (destination is a non-empty directory) without taking on
+             * full directory-replace semantics (replacing an *empty*
+             * directory is real but rarer NT behavior, left alone). */
+            if (S_ISDIR( st.st_mode ))
+            {
+                int dfd = open( name, O_RDONLY );
+                if (dfd != -1)
+                {
+                    int empty = is_dir_empty( dfd );
+                    close( dfd );
+                    if (!empty)
+                    {
+                        set_error( STATUS_DIRECTORY_NOT_EMPTY );
+                        goto failed;
+                    }
+                }
+            }
             set_error( STATUS_ACCESS_DENIED );
             goto failed;
         }
