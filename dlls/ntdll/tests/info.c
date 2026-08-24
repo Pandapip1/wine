@@ -2093,6 +2093,180 @@ static void test_query_process_times(void)
         "Inconsistent length %ld\n", ReturnLength);
 }
 
+/* Burn CPU in user mode until this process has accumulated at least "delta" more
+ * 100-ns units of user time than it had on entry; returns the new total. */
+static ULONGLONG burn_user_time( ULONGLONG delta )
+{
+    KERNEL_USER_TIMES times;
+    ULONGLONG start, deadline;
+    volatile double x = 0.0;
+    NTSTATUS status;
+    int i;
+
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &times, sizeof(times), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    start = times.UserTime.QuadPart;
+    deadline = GetTickCount64() + 60000;
+
+    for (;;)
+    {
+        for (i = 0; i < 1000000; i++) x += i * 0.5;
+        status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &times, sizeof(times), NULL );
+        ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+        if (status) return start;
+        if (times.UserTime.QuadPart >= start + delta) break;
+        if (GetTickCount64() > deadline)
+        {
+            ok( 0, "user time did not advance: start %s now %s\n",
+                wine_dbgstr_longlong(start), wine_dbgstr_longlong(times.UserTime.QuadPart) );
+            break;
+        }
+    }
+    return times.UserTime.QuadPart;
+}
+
+#define PROCESS_TIMES_READY_EVENT "wine_ntdll_info_test_process_times_ready"
+#define PROCESS_TIMES_RELEASE_EVENT "wine_ntdll_info_test_process_times_release"
+#define PROCESS_TIMES_CHILD_BURN (2500000)   /* 0.25 s */
+#define PROCESS_TIMES_PARENT_BURN (15000000) /* 1.5 s */
+
+/* child side: burn a small, well-defined amount of CPU, tell the parent, then block
+ * without consuming any more CPU until the parent has finished looking at us. */
+static void test_process_times_child(void)
+{
+    HANDLE ready, release;
+
+    burn_user_time( PROCESS_TIMES_CHILD_BURN );
+
+    ready = OpenEventA( EVENT_MODIFY_STATE, FALSE, PROCESS_TIMES_READY_EVENT );
+    ok( ready != NULL, "OpenEventA failed %lu\n", GetLastError() );
+    release = OpenEventA( SYNCHRONIZE, FALSE, PROCESS_TIMES_RELEASE_EVENT );
+    ok( release != NULL, "OpenEventA failed %lu\n", GetLastError() );
+    if (ready) SetEvent( ready );
+    /* waiting burns no CPU, so our totals stay put while the parent reads them */
+    if (release) WaitForSingleObject( release, 60000 );
+    CloseHandle( ready );
+    CloseHandle( release );
+}
+
+/* NtQueryInformationProcess(ProcessTimes) must report the times of the process the
+ * handle refers to, not the times of whoever is asking.  The two are only telling
+ * each other apart if the caller has burned a clearly different amount of CPU than
+ * the subject, so the parent deliberately burns several times as much as the child
+ * before it asks anything. */
+static void test_query_process_times_other( int argc, char **argv )
+{
+    KERNEL_USER_TIMES self1, self2, viahandle, running, exited, stable;
+    ULONGLONG parent_user;
+    PROCESS_INFORMATION pi;
+    char cmdline[MAX_PATH];
+    STARTUPINFOA si = { 0 };
+    HANDLE ready, release, self;
+    NTSTATUS status;
+    DWORD ret;
+    BOOL bret;
+
+    si.cb = sizeof(si);
+
+    ready = CreateEventA( NULL, TRUE, FALSE, PROCESS_TIMES_READY_EVENT );
+    ok( ready != NULL, "CreateEventA failed %lu\n", GetLastError() );
+    release = CreateEventA( NULL, TRUE, FALSE, PROCESS_TIMES_RELEASE_EVENT );
+    ok( release != NULL, "CreateEventA failed %lu\n", GetLastError() );
+
+    /* make the caller's own times large and distinctive first */
+    parent_user = burn_user_time( PROCESS_TIMES_PARENT_BURN );
+    ok( parent_user >= PROCESS_TIMES_PARENT_BURN, "parent user time too small: %s\n",
+        wine_dbgstr_longlong(parent_user) );
+
+    /* querying ourselves must keep working, through the pseudo handle and through a
+     * real handle to the same process; both have to agree. */
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &self1, sizeof(self1), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    self = OpenProcess( PROCESS_QUERY_INFORMATION, FALSE, GetCurrentProcessId() );
+    ok( self != NULL, "OpenProcess failed %lu\n", GetLastError() );
+    status = NtQueryInformationProcess( self, ProcessTimes, &viahandle, sizeof(viahandle), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &self2, sizeof(self2), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    CloseHandle( self );
+    ok( viahandle.UserTime.QuadPart + 1000000 >= self1.UserTime.QuadPart &&
+        viahandle.UserTime.QuadPart <= self2.UserTime.QuadPart + 1000000,
+        "user time via handle %s not consistent with self %s..%s\n",
+        wine_dbgstr_longlong(viahandle.UserTime.QuadPart),
+        wine_dbgstr_longlong(self1.UserTime.QuadPart),
+        wine_dbgstr_longlong(self2.UserTime.QuadPart) );
+    ok( !self1.ExitTime.QuadPart, "got ExitTime %s for a running process\n",
+        wine_dbgstr_longlong(self1.ExitTime.QuadPart) );
+    ok( self1.CreateTime.QuadPart != 0, "got no CreateTime\n" );
+
+    sprintf( cmdline, "%s %s process_times", argv[0], argv[1] );
+    bret = CreateProcessA( NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi );
+    ok( bret, "CreateProcessA failed %lu\n", GetLastError() );
+    if (!bret)
+    {
+        CloseHandle( ready );
+        CloseHandle( release );
+        return;
+    }
+
+    ret = WaitForSingleObject( ready, 60000 );
+    ok( ret == WAIT_OBJECT_0, "waiting for the child to burn its CPU returned %lu\n", ret );
+
+    /* the child is now idle, having used a fraction of what we used */
+    status = NtQueryInformationProcess( pi.hProcess, ProcessTimes, &running, sizeof(running), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &self2, sizeof(self2), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+
+    ok( running.UserTime.QuadPart >= PROCESS_TIMES_CHILD_BURN / 2,
+        "user time %s of the running child is too small, it burned at least %d\n",
+        wine_dbgstr_longlong(running.UserTime.QuadPart), PROCESS_TIMES_CHILD_BURN );
+    ok( running.UserTime.QuadPart * 2 < self2.UserTime.QuadPart,
+        "child user time %s looks like the caller's %s\n",
+        wine_dbgstr_longlong(running.UserTime.QuadPart),
+        wine_dbgstr_longlong(self2.UserTime.QuadPart) );
+    ok( running.CreateTime.QuadPart > self1.CreateTime.QuadPart,
+        "child CreateTime %s not after parent's %s\n",
+        wine_dbgstr_longlong(running.CreateTime.QuadPart),
+        wine_dbgstr_longlong(self1.CreateTime.QuadPart) );
+    ok( !running.ExitTime.QuadPart, "got ExitTime %s for a running child\n",
+        wine_dbgstr_longlong(running.ExitTime.QuadPart) );
+
+    SetEvent( release );
+    ret = WaitForSingleObject( pi.hProcess, 60000 );
+    ok( ret == WAIT_OBJECT_0, "waiting for the child to exit returned %lu\n", ret );
+
+    /* and the totals have to survive its exit */
+    status = NtQueryInformationProcess( pi.hProcess, ProcessTimes, &exited, sizeof(exited), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    ok( exited.UserTime.QuadPart != 0, "got no user time for the exited child\n" );
+    ok( exited.UserTime.QuadPart >= running.UserTime.QuadPart,
+        "user time went backwards over exit: %s then %s\n",
+        wine_dbgstr_longlong(running.UserTime.QuadPart),
+        wine_dbgstr_longlong(exited.UserTime.QuadPart) );
+    status = NtQueryInformationProcess( GetCurrentProcess(), ProcessTimes, &self2, sizeof(self2), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    ok( exited.UserTime.QuadPart * 2 < self2.UserTime.QuadPart,
+        "exited child user time %s looks like the caller's %s\n",
+        wine_dbgstr_longlong(exited.UserTime.QuadPart),
+        wine_dbgstr_longlong(self2.UserTime.QuadPart) );
+    ok( exited.ExitTime.QuadPart != 0, "got no ExitTime for the exited child\n" );
+
+    Sleep( 1000 );
+    status = NtQueryInformationProcess( pi.hProcess, ProcessTimes, &stable, sizeof(stable), NULL );
+    ok( !status, "NtQueryInformationProcess failed %08lx\n", status );
+    ok( stable.UserTime.QuadPart == exited.UserTime.QuadPart,
+        "user time of the exited child changed: %s then %s\n",
+        wine_dbgstr_longlong(exited.UserTime.QuadPart),
+        wine_dbgstr_longlong(stable.UserTime.QuadPart) );
+    ok( stable.ExitTime.QuadPart == exited.ExitTime.QuadPart, "ExitTime changed\n" );
+
+    CloseHandle( pi.hThread );
+    CloseHandle( pi.hProcess );
+    CloseHandle( ready );
+    CloseHandle( release );
+}
+
 static void test_query_process_debug_port(int argc, char **argv)
 {
     DWORD_PTR debug_port = 0xdeadbeef;
@@ -4686,6 +4860,7 @@ START_TEST(info)
     {
         if (strcmp(argv[2], "debuggee:dbgport") == 0) test_debuggee_dbgport(argc - 2, argv + 2);
         else if (!strcmp(argv[2], "check_pp_flags"))  test_debuggee_process_parameters_flags(argc - 2, argv + 2);
+        else if (!strcmp(argv[2], "process_times"))   test_process_times_child();
         return; /* Child */
     }
 
@@ -4721,6 +4896,7 @@ START_TEST(info)
     test_query_process_io();
     test_query_process_vm();
     test_query_process_times();
+    test_query_process_times_other(argc, argv);
     test_query_process_debug_port(argc, argv);
     test_query_process_debug_port_custom_dacl(argc, argv);
     test_query_process_priority();

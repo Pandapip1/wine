@@ -1248,26 +1248,39 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                 else if (!handle) ret = STATUS_INVALID_HANDLE;
                 else
                 {
-                    long ticks = sysconf(_SC_CLK_TCK);
-                    struct tms tms;
-
-                    /* FIXME: user/kernel times only work for current process */
-                    if (ticks && times( &tms ) != -1)
-                    {
-                        pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
-                        pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
-                    }
-
-                    SERVER_START_REQ(get_process_info)
+                    /* The server samples the CPU times of the process the handle refers to
+                     * and remembers them, so that they stay available once it has exited. */
+                    SERVER_START_REQ(get_process_times)
                     {
                         req->handle = wine_server_obj_handle( handle );
                         if ((ret = wine_server_call( req )) == STATUS_SUCCESS)
                         {
-                            pti.CreateTime.QuadPart = reply->start_time;
-                            pti.ExitTime.QuadPart = reply->end_time;
+                            pti.CreateTime.QuadPart = reply->create_time;
+                            pti.ExitTime.QuadPart = reply->exit_time;
+                            pti.UserTime.QuadPart = reply->user_time;
+                            pti.KernelTime.QuadPart = reply->kernel_time;
                         }
                     }
                     SERVER_END_REQ;
+
+                    if (ret == STATUS_SUCCESS && !pti.UserTime.QuadPart && !pti.KernelTime.QuadPart &&
+                        handle == GetCurrentProcess())
+                    {
+                        /* The server could not measure us (it has no way to on platforms
+                         * without /proc), but our own times we can always read.  This
+                         * fallback is deliberately restricted to the current process: for
+                         * any other handle we leave the times at zero rather than pass off
+                         * the caller's own numbers as the subject's, since a zero is
+                         * recognisable as "not known" and a wrong non-zero value is not. */
+                        long ticks = sysconf(_SC_CLK_TCK);
+                        struct tms tms;
+
+                        if (ticks && times( &tms ) != -1)
+                        {
+                            pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
+                            pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
+                        }
+                    }
 
                     memcpy(info, &pti, sizeof(KERNEL_USER_TIMES));
                     len = sizeof(KERNEL_USER_TIMES);
