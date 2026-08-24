@@ -1517,6 +1517,51 @@ static void alloc_test_row( HANDLE h, ULONGLONG initial_size, ULONGLONG request,
                          wine_dbgstr_longlong(after.EndOfFile.QuadPart) );
 }
 
+/* Perform one FileAllocationInformation request against the file exactly as it
+ * currently stands -- no reset in between -- and check both where the end of
+ * file ended up and what the allocation ended up being. Used for the sequences
+ * that shrink an allocation a previous request grew. */
+static void alloc_test_step( HANDLE h, ULONGLONG request, ULONGLONG expect_size,
+                             ULONGLONG expect_alloc, int line )
+{
+    FILE_ALLOCATION_INFORMATION fai;
+    FILE_STANDARD_INFORMATION before, after;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+
+    res = pNtQueryInformationFile( h, &io, &before, sizeof(before), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+
+    fai.AllocationSize.QuadPart = request;
+    res = pNtSetInformationFile( h, &io, &fai, sizeof(fai), FileAllocationInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "eof %s alloc %s request %s: "
+                         "NtSetInformationFile returned %lx\n",
+                         wine_dbgstr_longlong(before.EndOfFile.QuadPart),
+                         wine_dbgstr_longlong(before.AllocationSize.QuadPart),
+                         wine_dbgstr_longlong(request), res );
+    if (res) return;
+
+    res = pNtQueryInformationFile( h, &io, &after, sizeof(after), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+
+    trace( "eof %I64u alloc %I64u + request %I64u -> eof %I64u alloc %I64u\n",
+           before.EndOfFile.QuadPart, before.AllocationSize.QuadPart, request,
+           after.EndOfFile.QuadPart, after.AllocationSize.QuadPart );
+
+    ok_(__FILE__, line)( after.EndOfFile.QuadPart == expect_size,
+                         "eof %s alloc %s request %s: expected EndOfFile %s, got %s\n",
+                         wine_dbgstr_longlong(before.EndOfFile.QuadPart),
+                         wine_dbgstr_longlong(before.AllocationSize.QuadPart),
+                         wine_dbgstr_longlong(request), wine_dbgstr_longlong(expect_size),
+                         wine_dbgstr_longlong(after.EndOfFile.QuadPart) );
+    ok_(__FILE__, line)( after.AllocationSize.QuadPart == expect_alloc,
+                         "eof %s alloc %s request %s: expected allocation %s, got %s\n",
+                         wine_dbgstr_longlong(before.EndOfFile.QuadPart),
+                         wine_dbgstr_longlong(before.AllocationSize.QuadPart),
+                         wine_dbgstr_longlong(request), wine_dbgstr_longlong(expect_alloc),
+                         wine_dbgstr_longlong(after.AllocationSize.QuadPart) );
+}
+
 static void test_file_allocation_information(void)
 {
     FILE_ALLOCATION_INFORMATION fai;
@@ -1629,6 +1674,26 @@ static void test_file_allocation_information(void)
 
     /* asking for exactly what is already there changes nothing */
     alloc_test_row( h, cluster * 4, cluster * 4, cluster * 4, __LINE__ );
+
+    /* Two requests in a row on the same handle. When the rounded request lands
+     * above the end of file but below the current allocation, Windows releases
+     * the excess blocks and leaves the end of file exactly where it is -- the
+     * allocation follows the request downwards as well as upwards. Measured on
+     * Windows 11 Pro 22621, NTFS. The EndOfFile half of each check is what
+     * catches an implementation that reaches for a plain truncate. */
+    alloc_test_set_size( h, cluster, __LINE__ );
+    alloc_test_step( h, cluster * 4, cluster, cluster * 4, __LINE__ );
+    alloc_test_step( h, cluster * 2, cluster, cluster * 2, __LINE__ );
+
+    /* the same, shrinking all the way down to the end of file */
+    alloc_test_set_size( h, cluster, __LINE__ );
+    alloc_test_step( h, cluster * 4, cluster, cluster * 4, __LINE__ );
+    alloc_test_step( h, cluster, cluster, cluster, __LINE__ );
+
+    /* the control: growing an already grown allocation must keep working */
+    alloc_test_set_size( h, cluster, __LINE__ );
+    alloc_test_step( h, cluster * 2, cluster, cluster * 2, __LINE__ );
+    alloc_test_step( h, cluster * 4, cluster, cluster * 4, __LINE__ );
 
     /* a negative allocation is rejected */
     alloc_test_set_size( h, cluster, __LINE__ );

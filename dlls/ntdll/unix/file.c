@@ -554,6 +554,59 @@ static NTSTATUS reserve_file_blocks( int fd, ULONGLONG size )
 }
 
 
+/* Reserve blocks the way reserve_file_blocks() does, but report a filesystem that
+ * cannot do it instead of quietly leaving the file the way it was: a caller that
+ * has been asked for a specific allocation must not be told it got one. */
+static NTSTATUS reserve_file_blocks_strict( int fd, ULONGLONG size )
+{
+#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
+    if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, size ) == -1)
+    {
+        if (errno == EOPNOTSUPP || errno == ENOSYS)
+        {
+            WARN( "fallocate not supported on this filesystem\n" );
+            return STATUS_NOT_IMPLEMENTED;
+        }
+        return errno_to_status( errno );
+    }
+    return STATUS_SUCCESS;
+#else
+    WARN( "setting the allocation size is not supported on this platform\n" );
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+
+/* Release the blocks a file holds above the requested allocation without moving
+ * its end of file, the way NTFS gives up the clusters past a smaller request.
+ *
+ * FALLOC_FL_PUNCH_HOLE is not the primitive for this: measured on ext4, a hole
+ * punched over a range lying past the end of file returns success and leaves the
+ * preallocated blocks exactly where they were.  Truncating the file to the size
+ * it already has does release them, and cannot move the end of file, since that
+ * is the size the file is already at; whatever the request still wants past the
+ * end of file is reserved again afterwards.
+ *
+ * The blocks that are to be kept are asked for first, while the file is still
+ * intact, so that a filesystem which cannot reserve them is found out before
+ * anything has been given up.  The file already holds at least that many blocks
+ * at that point, so the extra call cannot need any new space. */
+static NTSTATUS shrink_file_allocation( int fd, off_t size, ULONGLONG alloc )
+{
+#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
+    NTSTATUS status;
+
+    if (alloc > (ULONGLONG)size && (status = reserve_file_blocks_strict( fd, alloc ))) return status;
+    if (ftruncate( fd, size ) == -1) return errno_to_status( errno );
+    if (alloc > (ULONGLONG)size) return reserve_file_blocks_strict( fd, alloc );
+    return STATUS_SUCCESS;
+#else
+    WARN( "releasing the allocated blocks is not supported on this platform\n" );
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+
 
 /* get space from the current directory data buffer, allocating a new one if necessary */
 static void *get_dir_data_space( struct dir_data *data, unsigned int size )
@@ -5446,7 +5499,7 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                     /* Windows rounds the requested allocation up to a whole number of
                      * clusters. If the result lands below the current end of file the
                      * file is truncated to it; otherwise the file size is left alone
-                     * and only the allocation grows. */
+                     * and the allocation follows the request in both directions. */
                     alloc = ((ULONGLONG)info->AllocationSize.QuadPart + cluster_size - 1) / cluster_size * cluster_size;
 
                     if (alloc < (ULONGLONG)st.st_size)
@@ -5461,21 +5514,14 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                     }
                     else if (alloc > (ULONGLONG)st.st_blocks * 512)
                     {
-#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
                         /* reserve the blocks for real, without moving the end of file */
-                        if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, alloc ) == -1)
-                        {
-                            if (errno == EOPNOTSUPP || errno == ENOSYS)
-                            {
-                                WARN( "fallocate not supported on this filesystem\n" );
-                                status = STATUS_NOT_IMPLEMENTED;
-                            }
-                            else status = errno_to_status( errno );
-                        }
-#else
-                        WARN( "setting the allocation size is not supported on this platform\n" );
-                        status = STATUS_NOT_IMPLEMENTED;
-#endif
+                        status = reserve_file_blocks_strict( fd, alloc );
+                    }
+                    else if (alloc < (ULONGLONG)st.st_blocks * 512)
+                    {
+                        /* give the blocks past the request back, again without
+                         * moving the end of file */
+                        status = shrink_file_allocation( fd, st.st_size, alloc );
                     }
                 }
             }
