@@ -83,6 +83,40 @@ enum afd_poll_bit
 #define AFD_POLL_UNK1           0x0200
 #define AFD_POLL_UNK2           0x0400
 
+/* Real Windows does not create a socket with an ioctl at all: it opens
+ * \Device\Afd with NtCreateFile and passes a FILE_FULL_EA_INFORMATION entry
+ * named "AfdOpenPacketXX" whose value is an AFD_OPEN_PACKET.  Layout and name
+ * per System Informer's phnt, ntafd.h (AfdOpenPacket, struct _AFD_OPEN_PACKET,
+ * struct _AFD_OPEN_PACKET_FULL_EA).  Wine's own ws2_32 instead opens the
+ * device bare and follows up with IOCTL_AFD_WINE_CREATE; the server accepts
+ * either.
+ *
+ * Note phnt declares AFD_OPEN_PACKET with a trailing WCHAR
+ * TransportDeviceName[ANYSIZE_ARRAY], so a C sizeof() of it is 28, not the 24
+ * bytes of fixed fields that actually precede the name on the wire; 24 is what
+ * the EA value must be at least.  ReactOS's driver (drivers/network/afd/afd/
+ * main.c, AfdCreateSocket) parses a different, 12-byte AFD_CREATE_PACKET with
+ * no AddressFamily/SocketType/Protocol at all -- that is the NT4/2000 shape,
+ * and it disagrees with phnt about everything after GroupID. */
+#define AFD_OPEN_PACKET_EA_NAME     "AfdOpenPacketXX"
+#define AFD_OPEN_PACKET_EA_NAME_LEN 15
+
+struct afd_open_packet
+{
+    unsigned int endpoint_flags;    /* AFD_ENDPOINT_FLAGS */
+    unsigned int group_id;          /* GROUP */
+    int          address_family;    /* AF_* */
+    int          socket_type;       /* SOCK_* */
+    int          protocol;          /* IPPROTO_* */
+    /* Length in *bytes* of the transport device name that follows, not in
+     * characters: phnt annotates the field _Field_size_bytes_opt_(), and
+     * ReactOS's msafd passes a UNICODE_STRING.Length, which is also bytes. */
+    unsigned int transport_device_name_len;
+    /* followed by transport_device_name_len bytes of WCHAR transport device
+     * name, e.g. L"\Device\Tcp" */
+};
+C_ASSERT( sizeof(struct afd_open_packet) == 24 );
+
 struct afd_bind_params
 {
     int unknown;

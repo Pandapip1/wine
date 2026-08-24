@@ -298,6 +298,7 @@ struct sock
     unsigned int        reset : 1;   /* did we get a TCP reset? */
     unsigned int        reuseaddr : 1; /* winsock SO_REUSEADDR option value */
     unsigned int        exclusiveaddruse : 1; /* winsock SO_EXCLUSIVEADDRUSE option value */
+    unsigned int        tdi_mode : 1; /* was a transport device named in the AFD open packet? */
 };
 
 static int is_tcp_socket( struct sock *sock )
@@ -1795,6 +1796,7 @@ static struct sock *create_socket(void)
     sock->reset = 0;
     sock->reuseaddr = 0;
     sock->exclusiveaddruse = 0;
+    sock->tdi_mode = 0;
     sock->rcvbuf = 0;
     sock->sndbuf = 0;
     sock->rcvtimeo = 0;
@@ -3186,6 +3188,19 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         socklen_t unix_len;
         int v6only = 1;
 
+        /* A socket whose open packet named a transport device is in TDI or
+         * hybrid transport mode, where AFD_BIND takes an AFD_BIND_INFO whose
+         * address is a TRANSPORT_ADDRESS, not the AFD_BIND_INFO_TL/SOCKADDR
+         * form below (phnt ntafd.h, the note above the AFD_BIND function
+         * number).  Wine only implements the TLI form; say so rather than
+         * misread a TDI address as a SOCKADDR. */
+        if (sock->tdi_mode)
+        {
+            if (debug_level) fprintf( stderr, "IOCTL_AFD_BIND: TDI-mode socket not supported\n" );
+            set_error( STATUS_NOT_IMPLEMENTED );
+            return;
+        }
+
         /* the ioctl is METHOD_NEITHER, so ntdll gives us the output buffer as
          * input */
         if (get_req_data_size() < get_reply_max_size())
@@ -4067,16 +4082,120 @@ static struct object *socket_device_lookup_name( struct object *obj, struct unic
     return NULL;
 }
 
+/* Look for the "AfdOpenPacketXX" entry in the FILE_FULL_EA_INFORMATION list of
+ * the NtCreateFile currently being handled -- the way real Windows is asked to
+ * create a socket, as opposed to Wine's own IOCTL_AFD_WINE_CREATE.  Returns 1
+ * and fills *packet (plus the transport device name that follows it) if the
+ * entry is present, 0 if the list is well formed but has no such entry, and -1
+ * with an error set if the list is malformed.
+ *
+ * A well-formed list with no such entry is not an error here: that is exactly
+ * what ws2_32 does (NtOpenFile takes no extended attributes at all), and
+ * ReactOS's AfdCreateSocket also treats a missing packet as a valid "control
+ * connection" open.  The socket is then left uninitialised until
+ * IOCTL_AFD_WINE_CREATE arrives.
+ *
+ * The structural checks mirror NT's IoCheckEaBufferValidity(), which runs in
+ * the I/O manager before any driver sees the buffer and fails a malformed list
+ * with STATUS_EA_LIST_INCONSISTENT.  Fields are read with memcpy because the
+ * buffer arrives at an arbitrary offset in the request data and its entries
+ * carry no alignment guarantee of their own. */
+static int find_afd_open_packet( struct afd_open_packet *packet,
+                                 const void **transport_name, data_size_t *transport_name_size )
+{
+    const unsigned char *ea;
+    data_size_t ea_size, pos = 0;
+
+    if (!(ea = get_open_file_ea( &ea_size ))) return 0;
+
+    for (;;)
+    {
+        data_size_t avail = ea_size - pos, value_off, entry_size;
+        unsigned int next_offset;
+        unsigned short value_len;
+        unsigned char name_len;
+
+        /* NextEntryOffset (4), Flags (1), EaNameLength (1), EaValueLength (2) */
+        if (avail < 8) goto inconsistent;
+        memcpy( &next_offset, ea + pos, sizeof(next_offset) );
+        name_len = ea[pos + 5];
+        memcpy( &value_len, ea + pos + 6, sizeof(value_len) );
+
+        /* the name is NUL-terminated and the NUL is not counted by EaNameLength */
+        value_off = 8 + (data_size_t)name_len + 1;
+        entry_size = value_off + value_len;
+        if (entry_size > avail) goto inconsistent;
+        if (ea[pos + 8 + name_len]) goto inconsistent;
+
+        if (name_len == AFD_OPEN_PACKET_EA_NAME_LEN
+            && !memcmp( ea + pos + 8, AFD_OPEN_PACKET_EA_NAME, AFD_OPEN_PACKET_EA_NAME_LEN ))
+        {
+            if (value_len < sizeof(*packet))
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return -1;
+            }
+            memcpy( packet, ea + pos + value_off, sizeof(*packet) );
+            *transport_name = ea + pos + value_off + sizeof(*packet);
+            *transport_name_size = value_len - sizeof(*packet);
+            return 1;
+        }
+
+        if (!next_offset) return 0;
+        if (next_offset < entry_size || (next_offset & 3) || next_offset >= avail) goto inconsistent;
+        pos += next_offset;
+    }
+
+inconsistent:
+    set_error( STATUS_EA_LIST_INCONSISTENT );
+    return -1;
+}
+
 static struct object *socket_device_open_file( struct object *obj, unsigned int access,
                                                unsigned int sharing, unsigned int options )
 {
+    struct afd_open_packet packet;
+    const void *transport_name;
+    data_size_t transport_name_size;
     struct sock *sock;
+    int have_packet;
+
+    if ((have_packet = find_afd_open_packet( &packet, &transport_name, &transport_name_size )) < 0)
+        return NULL;
 
     if (!(sock = create_socket())) return NULL;
     if (!(sock->fd = alloc_pseudo_fd( &sock_fd_ops, &sock->obj, options )))
     {
         release_object( sock );
         return NULL;
+    }
+
+    if (have_packet)
+    {
+        if (packet.transport_device_name_len)
+        {
+            if (packet.transport_device_name_len > transport_name_size
+                || (packet.transport_device_name_len % sizeof(WCHAR)))
+            {
+                release_object( sock );
+                set_error( STATUS_INVALID_PARAMETER );
+                return NULL;
+            }
+            /* Naming a transport device (e.g. L"\\Device\\Tcp") selects TDI or
+             * hybrid transport mode instead of the default TLI one, which
+             * changes the structures AFD's ioctls take -- see phnt ntafd.h's
+             * note above the AFD_* function numbers.  Wine has no TDI
+             * transport, so the name itself is ignored, but the mode is
+             * remembered so the ioctls that differ can report that rather than
+             * decode the wrong structure. */
+            sock->tdi_mode = 1;
+        }
+
+        if (init_socket( sock, packet.address_family, packet.socket_type, packet.protocol ) < 0)
+        {
+            release_object( sock );
+            return NULL;
+        }
     }
     return &sock->obj;
 }

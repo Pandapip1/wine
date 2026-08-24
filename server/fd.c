@@ -3018,10 +3018,39 @@ DECL_HANDLER(get_volume_info)
 }
 
 /* open a file object */
+/* The FILE_FULL_EA_INFORMATION list of the create request currently being
+ * handled, or NULL.  On Windows the I/O manager passes the extended attributes
+ * NtCreateFile was given to the driver in the create IRP; open_file handlers
+ * that care (so far only \Device\Afd, which takes its AFD_OPEN_PACKET this
+ * way) read them back with get_open_file_ea().  This is only ever set around
+ * the open_file call below, and the server handles one request at a time, so
+ * it cannot outlive or interleave with the request that supplied it. */
+static const void *open_file_ea;
+static data_size_t open_file_ea_size;
+
+const void *get_open_file_ea( data_size_t *size )
+{
+    *size = open_file_ea_size;
+    return open_file_ea;
+}
+
 DECL_HANDLER(open_file_object)
 {
     struct object *obj, *result;
-    struct object_params params = { .name = get_req_unicode_str(), .attr = req->attributes };
+    struct unicode_str name = get_req_unicode_str();
+    data_size_t ea_size = req->ea_size;
+    struct object_params params;
+
+    /* The name and the extended attributes share the request varargs: the name
+     * comes first and ea_size bytes of extended attributes follow it. */
+    if (ea_size > get_req_data_size())
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    name.len = ((get_req_data_size() - ea_size) / sizeof(WCHAR)) * sizeof(WCHAR);
+
+    params = (struct object_params){ .name = name, .attr = req->attributes };
 
     if (req->rootdir && !(params.root = get_handle_obj( current->process, req->rootdir, 0, NULL ))) return;
 
@@ -3030,10 +3059,18 @@ DECL_HANDLER(open_file_object)
     if (!obj) return;
 
     if (!obj->ops->open_file) set_error( STATUS_OBJECT_TYPE_MISMATCH );
-    else if ((result = obj->ops->open_file( obj, req->access, req->sharing, req->options )))
+    else
     {
-        reply->handle = alloc_handle( current->process, result, req->access, req->attributes );
-        release_object( result );
+        open_file_ea = ea_size ? (const char *)get_req_data() + get_req_data_size() - ea_size : NULL;
+        open_file_ea_size = ea_size;
+        result = obj->ops->open_file( obj, req->access, req->sharing, req->options );
+        open_file_ea = NULL;
+        open_file_ea_size = 0;
+        if (result)
+        {
+            reply->handle = alloc_handle( current->process, result, req->access, req->attributes );
+            release_object( result );
+        }
     }
     release_object( obj );
 }

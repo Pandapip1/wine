@@ -2328,10 +2328,18 @@ static NTSTATUS server_get_file_info( HANDLE handle, IO_STATUS_BLOCK *io, void *
 }
 
 
+/* Open a device or other object-manager object.  ea_buffer/ea_length are the
+ * FILE_FULL_EA_INFORMATION list NtCreateFile was given; on Windows the I/O
+ * manager hands these to the driver in the create IRP, so they are forwarded
+ * to the server, which passes them to the object's open_file handler.  They
+ * are appended after the name in the request varargs and delimited by
+ * req->ea_size. */
 static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBUTES *attr,
-                                             ULONG sharing, ULONG options )
+                                             ULONG sharing, ULONG options, void *ea_buffer, ULONG ea_length )
 {
     unsigned int status;
+
+    if (!ea_buffer) ea_length = 0;
 
     SERVER_START_REQ( open_file_object )
     {
@@ -2340,7 +2348,9 @@ static unsigned int server_open_file_object( HANDLE *handle, ACCESS_MASK access,
         req->rootdir    = wine_server_obj_handle( attr->RootDirectory );
         req->sharing    = sharing;
         req->options    = options;
+        req->ea_size    = ea_length;
         wine_server_add_data( req, attr->ObjectName->Buffer, attr->ObjectName->Length );
+        if (ea_length) wine_server_add_data( req, ea_buffer, ea_length );
         status = wine_server_call( req );
         *handle = wine_server_ptr_handle( reply->handle );
     }
@@ -2474,7 +2484,7 @@ static NTSTATUS get_mountmgr_fs_info( HANDLE handle, int fd, struct mountmgr_uni
     init_unicode_string( &string, MOUNTMGR_DEVICE_NAME );
     InitializeObjectAttributes( &attr, &string, 0, NULL, NULL );
     status = server_open_file_object( &mountmgr, GENERIC_READ | SYNCHRONIZE, &attr,
-                                      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_NONALERT );
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
     if (status) return status;
 
     status = sync_ioctl( mountmgr, IOCTL_MOUNTMGR_QUERY_UNIX_DRIVE, drive, sizeof(*drive), drive, size );
@@ -4722,7 +4732,8 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     if (status == STATUS_BAD_DEVICE_TYPE)
     {
-        status = server_open_file_object( handle, access, &new_attr, sharing, options );
+        status = server_open_file_object( handle, access, &new_attr, sharing, options,
+                                          ea_buffer, ea_length );
         if (status == STATUS_SUCCESS) io->Information = FILE_OPENED;
         goto done;
     }

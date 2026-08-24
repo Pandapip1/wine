@@ -1671,7 +1671,8 @@ enum event_op { PULSE_EVENT, SET_EVENT, RESET_EVENT };
     obj_handle_t rootdir;       /* root directory */
     unsigned int sharing;       /* sharing flags */
     unsigned int options;       /* file options */
-    VARARG(filename,unicode_str); /* file name */
+    data_size_t  ea_size;       /* size of the extended attribute buffer at the end of the varargs */
+    VARARG(filename,unicode_str); /* file name, followed by ea_size bytes of FILE_FULL_EA_INFORMATION */
 @REPLY
     obj_handle_t handle;        /* handle to the file */
 @END

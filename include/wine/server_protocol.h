@@ -1938,7 +1938,9 @@ struct open_file_object_request
     obj_handle_t rootdir;
     unsigned int sharing;
     unsigned int options;
+    data_size_t  ea_size;
     /* VARARG(filename,unicode_str); */
+    char __pad_36[4];
 };
 struct open_file_object_reply
 {
@@ -7215,6 +7217,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 963
+#define SERVER_PROTOCOL_VERSION 964
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

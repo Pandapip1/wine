@@ -205,6 +205,9 @@ extern struct obj_locator get_shared_object_locator( volatile void *object_shm )
         WriteRelease64( &__obj->seq, __end );                           \
     } while(0)
 
+/* the extended attributes of the create request being handled, or NULL */
+extern const void *get_open_file_ea( data_size_t *size );
+
 /* device functions */
 
 extern struct object *create_named_pipe_device( struct object *root, struct unicode_str name,
