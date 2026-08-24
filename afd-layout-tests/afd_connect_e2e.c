@@ -44,8 +44,9 @@ static void check(int ok, const char *what, NTSTATUS got, NTSTATUS want)
 static ULONG build_ea(unsigned char *buf, int fam, int type, int proto)
 {
     static const char name[] = "AfdOpenPacketXX";
-    static const WCHAR tcp[] = L"\\Device\\Tcp";
-    ULONG off, tdnl = (ULONG)sizeof(tcp);
+    /* No transport device name: that would put the socket in TDI/hybrid mode,
+     * where Wine's IOCTL_AFD_BIND reports STATUS_NOT_IMPLEMENTED. */
+    ULONG off, tdnl = 0;
     memset(buf, 0, 512);
     *(ULONG *)buf = 0;
     buf[4] = 0;
@@ -60,7 +61,6 @@ static ULONG build_ea(unsigned char *buf, int fam, int type, int proto)
     *(LONG *)(buf + off + 12) = type;
     *(LONG *)(buf + off + 16) = proto;
     *(ULONG *)(buf + off + 20) = tdnl;
-    memcpy(buf + off + 24, tcp, tdnl);
     return off + 24 + tdnl;
 }
 
