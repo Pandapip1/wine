@@ -499,6 +499,27 @@ static int xattr_fget( int filedes, const char *name, void *value, size_t size )
 #endif
 }
 
+/* Retrieve an extended attribute for a name that may be relative to a
+ * directory fd.  There is no portable getxattr() that takes a dirfd, so for
+ * the relative case open the file and use the fd-based call; a failure to
+ * open is reported as "not supported", the same way a filesystem without
+ * extended attributes is. */
+static int xattr_get_at( int root_fd, const char *path, const char *name, void *value, size_t size )
+{
+    int fd, ret;
+
+    if (root_fd == AT_FDCWD) return xattr_get( path, name, value, size );
+    if ((fd = openat( root_fd, path, O_RDONLY | O_NONBLOCK )) == -1)
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+    ret = xattr_fget( fd, name, value, size );
+    close( fd );
+    return ret;
+}
+
+
 
 /* get space from the current directory data buffer, allocating a new one if necessary */
 static void *get_dir_data_space( struct dir_data *data, unsigned int size )
@@ -1772,7 +1793,11 @@ static NTSTATUS fd_set_file_info( int fd, UINT attr, BOOL force_set_xattr )
 
 
 /* get the stat info and file attributes for a file (by name) */
-static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag )
+/* Retrieve the information for a Unix file name.  The name may be relative to
+ * root_fd (AT_FDCWD for a name that is already absolute or relative to the
+ * process working directory), the way the object manager resolves a name
+ * against OBJECT_ATTRIBUTES.RootDirectory. */
+static int get_file_info_at( int root_fd, const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag )
 {
     char buffer[MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
     size_t len = strlen( path );
@@ -1781,12 +1806,12 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     int attr_len, ret;
 
     *attr = 0;
-    ret = lstat( path, st );
+    ret = fstatat( root_fd, path, st, AT_SYMLINK_NOFOLLOW );
     if (ret == -1) return ret;
     if (reparse_tag) *reparse_tag = 0;
     if (S_ISLNK( st->st_mode ))
     {
-        ret = stat( path, st );
+        ret = fstatat( root_fd, path, st, 0 );
         if (ret == -1) return ret;
         /* is a symbolic link and a directory, consider these "reparse points" */
         if (S_ISDIR( st->st_mode ))
@@ -1802,7 +1827,7 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
         /* consider mount points to be reparse points (IO_REPARSE_TAG_MOUNT_POINT) */
         strcpy( parent_path, path );
         strcat( parent_path, "/.." );
-        if (!stat( parent_path, &parent_st )
+        if (!fstatat( root_fd, parent_path, &parent_st, 0 )
                 && (st->st_dev != parent_st.st_dev || st->st_ino == parent_st.st_ino))
         {
             *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
@@ -1813,14 +1838,14 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     }
     *attr |= get_file_attributes( st );
 
-    attr_len = xattr_get( path, XATTR_REPARSE, buffer, sizeof(buffer) );
+    attr_len = xattr_get_at( root_fd, path, XATTR_REPARSE, buffer, sizeof(buffer) );
     if (attr_len >= 0 && attr_len >= sizeof(ULONG))
     {
         *attr |= FILE_ATTRIBUTE_REPARSE_POINT;
         if (reparse_tag) memcpy( reparse_tag, buffer, sizeof(ULONG) );
     }
 
-    attr_len = xattr_get( path, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
+    attr_len = xattr_get_at( root_fd, path, SAMBA_XATTR_DOS_ATTRIB, attr_data, sizeof(attr_data)-1 );
     if (attr_len != -1)
         *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
     else
@@ -1839,6 +1864,12 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG 
     }
     return ret;
 }
+
+static int get_file_info( const char *path, struct stat *st, ULONG *attr, ULONG *reparse_tag )
+{
+    return get_file_info_at( AT_FDCWD, path, st, attr, reparse_tag );
+}
+
 
 
 #if defined(__ANDROID__) && !defined(HAVE_FUTIMENS)
@@ -4882,27 +4913,34 @@ NTSTATUS WINAPI NtDeleteFile( OBJECT_ATTRIBUTES *attr )
 
 
 /******************************************************************************
- *              NtQueryFullAttributesFile   (NTDLL.@)
+ *           lookup_file_attributes
+ *
+ * Helper for NtQueryAttributesFile and NtQueryFullAttributesFile.
+ *
+ * A name that was resolved against attr->RootDirectory comes back relative to
+ * that directory, so it has to be looked up relative to it as well; stat'ing
+ * it as-is would resolve it against the process working directory and answer
+ * about an entirely different file.  This is the same root directory fd that
+ * nt_to_unix_file_name() and the server's create_file handler resolve against.
  */
-NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
-                                           FILE_NETWORK_OPEN_INFORMATION *info )
+static unsigned int lookup_file_attributes( const OBJECT_ATTRIBUTES *attr, struct stat *st,
+                                            ULONG *attributes )
 {
+    OBJECT_ATTRIBUTES new_attr = *attr;
+    UNICODE_STRING nt_name;
     char *unix_name;
     unsigned int status;
-    UNICODE_STRING nt_name;
-    OBJECT_ATTRIBUTES new_attr = *attr;
+    int root_fd = AT_FDCWD, needs_close = 0;
 
     if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
     {
-        ULONG attributes;
-        struct stat st;
-
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
-            status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
-            status = STATUS_INVALID_INFO_CLASS;
-        else
-            fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
+        if (!new_attr.RootDirectory ||
+            !(status = server_get_unix_fd( new_attr.RootDirectory, 0, &root_fd, &needs_close, NULL, NULL )))
+        {
+            if (get_file_info_at( root_fd, unix_name, st, attributes, NULL ) == -1)
+                status = errno_to_status( errno );
+            if (needs_close) close( root_fd );
+        }
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
     free( unix_name );
@@ -4912,30 +4950,42 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
 
 
 /******************************************************************************
+ *              NtQueryFullAttributesFile   (NTDLL.@)
+ */
+NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
+                                           FILE_NETWORK_OPEN_INFORMATION *info )
+{
+    ULONG attributes;
+    struct stat st;
+    unsigned int status;
+
+    if (!(status = lookup_file_attributes( attr, &st, &attributes )))
+    {
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+            status = STATUS_INVALID_INFO_CLASS;
+        else
+            fill_file_info( &st, attributes, info, FileNetworkOpenInformation );
+    }
+    return status;
+}
+
+
+/******************************************************************************
  *              NtQueryAttributesFile   (NTDLL.@)
  */
 NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC_INFORMATION *info )
 {
-    char *unix_name;
+    ULONG attributes;
+    struct stat st;
     unsigned int status;
-    UNICODE_STRING nt_name;
-    OBJECT_ATTRIBUTES new_attr = *attr;
 
-    if (!(status = get_nt_and_unix_names( &new_attr, &nt_name, &unix_name, FILE_OPEN, TRUE )))
+    if (!(status = lookup_file_attributes( attr, &st, &attributes )))
     {
-        ULONG attributes;
-        struct stat st;
-
-        if (get_file_info( unix_name, &st, &attributes, NULL ) == -1)
-            status = errno_to_status( errno );
-        else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
+        if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
             status = fill_file_info( &st, attributes, info, FileBasicInformation );
     }
-    else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
-    free( unix_name );
-    free( nt_name.Buffer );
     return status;
 }
 
