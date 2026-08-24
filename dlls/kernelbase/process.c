@@ -193,6 +193,19 @@ static RTL_USER_PROCESS_PARAMETERS *create_process_params( const WCHAR *filename
         params->ConsoleFlags = 1;
 
     if (flags & CREATE_NEW_CONSOLE) params->ConsoleHandle = CONSOLE_HANDLE_ALLOC;
+    else if (flags & DETACHED_PROCESS)
+    {
+        /* Explicitly record "no console wanted" so that init_console()
+         * (dlls/kernelbase/console.c) can tell it apart from ConsoleHandle
+         * simply never having been set -- which is what a caller building
+         * RTL_USER_PROCESS_PARAMETERS itself and calling
+         * NtCreateUserProcess/RtlCreateUserProcess directly (bypassing this
+         * function entirely) leaves behind. Real NT still gives such a
+         * caller's CUI-subsystem child a console; only an explicit
+         * DETACHED_PROCESS should suppress that. Before this, both cases
+         * left ConsoleHandle at plain NULL and were indistinguishable. */
+        params->ConsoleHandle = CONSOLE_HANDLE_DETACHED;
+    }
     else if (!(flags & DETACHED_PROCESS))
     {
         if (flags & CREATE_NO_WINDOW) params->ConsoleHandle = CONSOLE_HANDLE_ALLOC_NO_WINDOW;

@@ -2395,13 +2395,33 @@ void init_console( void )
         }
     }
     else if (params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
-             params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW)
+             params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+             params->ConsoleHandle == NULL)
     {
+        /* ConsoleHandle == NULL means "not specified" here, not "no console
+         * wanted": that's what a process ends up with when it (or whatever
+         * created it) never set ConsoleHandle at all, e.g. a caller that
+         * builds RTL_USER_PROCESS_PARAMETERS itself and calls
+         * NtCreateUserProcess/RtlCreateUserProcess directly instead of going
+         * through kernel32's CreateProcess (which always resolves
+         * ConsoleHandle to either an inherited handle or one of the
+         * CONSOLE_HANDLE_ALLOC / DETACHED sentinels before ever reaching
+         * here). Real NT still gives such a CUI-subsystem process a console
+         * in that case -- treat it the same as CONSOLE_HANDLE_ALLOC. This
+         * used to fall through to the final "do nothing" branch below,
+         * which left ConsoleHandle alone and skipped console setup (and
+         * with it, init_console_std_handles()'s NULL-std-handle backfill)
+         * entirely, silently treating "unspecified" as "explicitly none". */
         BOOL no_window = params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW;
         HMODULE mod = GetModuleHandleW( NULL );
         params->ConsoleHandle = NULL;
         if (RtlImageNtHeader( mod )->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI)
             alloc_console( no_window );
+    }
+    else if (params->ConsoleHandle == CONSOLE_HANDLE_DETACHED)
+    {
+        /* explicit DETACHED_PROCESS: no console wanted, nothing to do */
+        params->ConsoleHandle = NULL;
     }
     else if (params->ConsoleHandle && params->ConsoleHandle != CONSOLE_HANDLE_SHELL_NO_WINDOW)
     {

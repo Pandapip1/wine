@@ -203,5 +203,9 @@ struct condrv_ctrl_event
 #define CONSOLE_HANDLE_ALLOC_NO_WINDOW  LongToHandle(-2)
 #define CONSOLE_HANDLE_SHELL            LongToHandle(-3)
 #define CONSOLE_HANDLE_SHELL_NO_WINDOW  LongToHandle(-4)
+/* explicitly "no console" (DETACHED_PROCESS), as opposed to ConsoleHandle
+ * being NULL because it was never set at all -- see kernelbase/process.c's
+ * create_process_params() and kernelbase/console.c's init_console(). */
+#define CONSOLE_HANDLE_DETACHED         LongToHandle(-5)
 
 #endif /* _INC_CONDRV */
