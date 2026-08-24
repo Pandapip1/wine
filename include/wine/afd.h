@@ -124,26 +124,66 @@ struct afd_bind_params
 };
 C_ASSERT( sizeof(struct afd_bind_params) == 20 );
 
-/* Wire format of AFD_CONNECT_INFO (ReactOS shared.h) followed by a
- * TRANSPORT_ADDRESS containing exactly one TA_ADDRESS. This is ReactOS's
- * reimplementation of the real, undocumented AFD connect ioctl input; it has
- * not been verified against real Windows. Only TDI_ADDRESS_TYPE_IP (AF_INET)
- * and TDI_ADDRESS_TYPE_IP6 (AF_INET6) are handled; TDI_ADDRESS_IP/IP6 are
- * byte-packed (see ReactOS tdi.h, wrapped in pshpack1.h) and are byte-for-byte
- * struct sockaddr_in/sockaddr_in6 minus the leading 2-byte sa_family/sin6_len
- * field, since the family is instead carried out-of-band in addr_type below. */
-struct afd_connect_info_params
+/* Wire format of the real AFD connect ioctl's input: an AFD_CONNECT_INFO
+ * header, followed immediately by a TRANSPORT_ADDRESS holding exactly one
+ * TA_ADDRESS.
+ *
+ * The header's second and third fields are HANDLEs, not ULONGs.  System
+ * Informer's phnt declares (ntafd.h):
+ *
+ *     typedef struct _AFD_CONNECT_JOIN_INFO {
+ *         BOOLEAN SanActive;
+ *         HANDLE RootEndpoint;
+ *         HANDLE ConnectEndpoint;
+ *         TRANSPORT_ADDRESS RemoteAddress;
+ *     } AFD_CONNECT_JOIN_INFO;
+ *
+ * and shares that one structure between AFD_CONNECT (operation 1) and
+ * AFD_JOIN_LEAF (operation 46) -- the multipoint root/leaf endpoint *handles*
+ * WSAJoinLeaf() passes.  Upstream ReactOS instead declares ULONG Root; ULONG
+ * Unknown (sdk/include/reactos/drivers/afd/shared.h as of 763ce84cf5), which
+ * is where this struct's first version in Wine came from.  The two agree on
+ * i386, where a HANDLE is 4 bytes and the TRANSPORT_ADDRESS starts at +12
+ * either way, and disagree on x86_64, where a HANDLE is 8 bytes and 8-aligned
+ * and the TRANSPORT_ADDRESS starts at +24.  Real Windows uses the +24 form:
+ * see the commit message for the measurement.
+ *
+ * The server is a single 64-bit process serving both 64-bit and WOW64 32-bit
+ * clients, so both layouts are declared here and the handler picks one on the
+ * client's machine, as it already does for afd_event_select_params_64/_32.
+ * The padding is spelled out rather than left to the compiler so that these
+ * describe the wire format on any host ABI (notably i386, where __alignof__
+ * of a 64-bit integer is 4, not 8).
+ *
+ * Only TDI_ADDRESS_TYPE_IP (AF_INET) and TDI_ADDRESS_TYPE_IP6 (AF_INET6) are
+ * handled.  TDI_ADDRESS_IP/IP6 are byte-packed (tdi.h wraps them in
+ * pshpack1.h) and are byte-for-byte struct sockaddr_in/sockaddr_in6 minus the
+ * leading 2-byte sa_family field, since the family is instead carried
+ * out-of-band in addr_type below.
+ *
+ * Each header is immediately followed by:
+ *   LONG   addr_count;  -- TRANSPORT_ADDRESS.TAAddressCount, must be 1
+ *   USHORT addr_len;    -- TA_ADDRESS.AddressLength
+ *   USHORT addr_type;   -- TA_ADDRESS.AddressType (TDI_ADDRESS_TYPE_IP == 2, _IP6 == 23)
+ *   BYTE   addr[];      -- TDI_ADDRESS_IP or TDI_ADDRESS_IP6, addr_len bytes
+ */
+struct afd_connect_info_params_64
 {
-    BOOLEAN use_san;
-    UINT root;
-    UINT unknown;
-    /* immediately followed by:
-     *   LONG addr_count;    -- TRANSPORT_ADDRESS.TAAddressCount, must be 1
-     *   USHORT addr_len;    -- TA_ADDRESS.AddressLength
-     *   USHORT addr_type;   -- TA_ADDRESS.AddressType (TDI_ADDRESS_TYPE_IP == 2, _IP6 == 23)
-     *   BYTE addr[];        -- TDI_ADDRESS_IP or TDI_ADDRESS_IP6, addr_len bytes
-     */
+    BOOLEAN   san_active;
+    UCHAR     pad[7];
+    ULONGLONG root_endpoint;
+    ULONGLONG connect_endpoint;
 };
+C_ASSERT( sizeof(struct afd_connect_info_params_64) == 24 );
+
+struct afd_connect_info_params_32
+{
+    BOOLEAN   san_active;
+    UCHAR     pad[3];
+    UINT      root_endpoint;
+    UINT      connect_endpoint;
+};
+C_ASSERT( sizeof(struct afd_connect_info_params_32) == 12 );
 
 #define TDI_ADDRESS_TYPE_IP     2
 #define TDI_ADDRESS_TYPE_IP6    23

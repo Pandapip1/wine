@@ -2821,18 +2821,19 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
     }
 
     /* The real (non-Wine-invented) AFD_CONNECT ioctl. Input is AFD_CONNECT_INFO
-     * followed by a TRANSPORT_ADDRESS holding one TA_ADDRESS, per ReactOS's
-     * shared.h -- see struct afd_connect_info_params in include/wine/afd.h for
-     * the exact byte layout assumed here and the caveat that it is unverified
-     * against real Windows. Unlike IOCTL_AFD_WINE_CONNECT this never pipelines
-     * a send buffer with the connect, and always requires a prior real bind
-     * (IOCTL_AFD_BIND) -- both are design choices made for this prototype, not
-     * confirmed real-Windows behaviour. */
+     * followed by a TRANSPORT_ADDRESS holding one TA_ADDRESS -- see struct
+     * afd_connect_info_params_64/_32 in include/wine/afd.h for the byte layout
+     * and its sources. The header is 24 bytes for a 64-bit client and 12 for a
+     * 32-bit one, because two of its three fields are HANDLEs, so the layout is
+     * chosen on the client's machine the way IOCTL_AFD_EVENT_SELECT already
+     * does. Unlike IOCTL_AFD_WINE_CONNECT this never pipelines a send buffer
+     * with the connect, and always requires a prior real bind (IOCTL_AFD_BIND)
+     * -- both are design choices made for this prototype, not confirmed
+     * real-Windows behaviour. */
     case IOCTL_AFD_CONNECT:
     {
-        const struct afd_connect_info_params *info = get_req_data();
         const unsigned char *tail;
-        data_size_t tail_size, fixed_tail;
+        data_size_t tail_size, fixed_tail, info_size;
         LONG addr_count;
         USHORT addr_len, addr_type;
         union win_sockaddr win_addr;
@@ -2842,14 +2843,19 @@ static void sock_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
         socklen_t unix_len;
         int ret;
 
+        if (is_machine_64bit( current->process->machine ))
+            info_size = sizeof(struct afd_connect_info_params_64);
+        else
+            info_size = sizeof(struct afd_connect_info_params_32);
+
         fixed_tail = sizeof(LONG) + 2 * sizeof(USHORT);
-        if (get_req_data_size() < sizeof(*info) + fixed_tail)
+        if (get_req_data_size() < info_size + fixed_tail)
         {
             set_error( STATUS_BUFFER_TOO_SMALL );
             return;
         }
-        tail = (const unsigned char *)get_req_data() + sizeof(*info);
-        tail_size = get_req_data_size() - sizeof(*info);
+        tail = (const unsigned char *)get_req_data() + info_size;
+        tail_size = get_req_data_size() - info_size;
 
         memcpy( &addr_count, tail, sizeof(addr_count) );
         memcpy( &addr_len, tail + sizeof(addr_count), sizeof(addr_len) );
