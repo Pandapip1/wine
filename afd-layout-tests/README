@@ -1,0 +1,19 @@
+Structural and end-to-end tests for the real IOCTL_AFD_CONNECT input layout.
+
+  afd_connect_layout_test.sh   host test; extracts struct
+                               afd_connect_info_params_64/_32 from
+                               ../include/wine/afd.h and re-parses requests
+                               built from them using only documented byte
+                               offsets.  Device-free, no Wine needed.
+
+  afd_connect_e2e.c            ntdll-only PE probe; run under a Wine build from
+                               this tree, once as x86_64 and once as i386.
+                               Case A: a good native-layout connect succeeds.
+                               Case B: a truncated request is rejected with
+                                       STATUS_BUFFER_TOO_SMALL.
+                               Case C: a ReactOS-layout request -- the same
+                                       layout on i386 (must still succeed),
+                                       12 bytes short on x86_64 (must fail).
+
+Always run Wine binaries with WINEDEBUG=-all WINEDLLOVERRIDES=winedbg.exe=d
+and stdin from /dev/null, and with a private WINEPREFIX.
