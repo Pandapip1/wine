@@ -1648,6 +1648,119 @@ static void test_file_allocation_information(void)
     CloseHandle( h );
 }
 
+
+/* Query the allocation size of a freshly made file.  Returns FALSE if the
+ * volume information needed to interpret it is unavailable. */
+static BOOL sparse_test_query( HANDLE h, ULONGLONG *eof, ULONGLONG *alloc, int line )
+{
+    FILE_STANDARD_INFORMATION fsi;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+    if (res) return FALSE;
+    *eof = fsi.EndOfFile.QuadPart;
+    *alloc = fsi.AllocationSize.QuadPart;
+    return TRUE;
+}
+
+static void mark_sparse( HANDLE h, int line )
+{
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+
+    res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_SET_SPARSE, NULL, 0, NULL, 0 );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "FSCTL_SET_SPARSE returned %lx\n", res );
+}
+
+/* Windows files are not sparse unless they are marked so.  Extending one with
+ * FileEndOfFileInformation therefore allocates real clusters, while extending a
+ * file that has been marked sparse allocates nothing at all. */
+static void test_file_sparse_allocation(void)
+{
+    FILE_END_OF_FILE_INFORMATION feof;
+    FILE_FS_SIZE_INFORMATION fssi;
+    ULONGLONG cluster, size, eof, alloc;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+    DWORD count;
+    HANDLE h;
+    char c = 0;
+
+    if (!(h = create_temp_file(0))) return;
+
+    res = pNtQueryVolumeInformationFile( h, &io, &fssi, sizeof(fssi), FileFsSizeInformation );
+    ok( res == STATUS_SUCCESS, "cannot get volume size info, res %lx\n", res );
+    cluster = res ? 0 : (ULONGLONG)fssi.BytesPerSector * fssi.SectorsPerAllocationUnit;
+    ok( cluster != 0, "bad cluster size\n" );
+    CloseHandle( h );
+    if (!cluster) return;
+    size = cluster * 4;
+
+    /* a file that has not been marked sparse, extended and never written to:
+     * the clusters are allocated for real */
+    if (!(h = create_temp_file(0))) return;
+    feof.EndOfFile.QuadPart = size;
+    res = pNtSetInformationFile( h, &io, &feof, sizeof(feof), FileEndOfFileInformation );
+    ok( res == STATUS_SUCCESS, "setting the end of file failed, res %lx\n", res );
+    if (sparse_test_query( h, &eof, &alloc, __LINE__ ))
+    {
+        trace( "extended, not sparse: eof %I64u alloc %I64u\n", eof, alloc );
+        ok( eof == size, "expected EndOfFile %I64u, got %I64u\n", size, eof );
+        ok( alloc == size, "extending a file that is not sparse: expected allocation %I64u, got %I64u\n",
+            size, alloc );
+    }
+    CloseHandle( h );
+
+    /* the same file marked sparse first: nothing is allocated */
+    if (!(h = create_temp_file(0))) return;
+    mark_sparse( h, __LINE__ );
+    feof.EndOfFile.QuadPart = size;
+    res = pNtSetInformationFile( h, &io, &feof, sizeof(feof), FileEndOfFileInformation );
+    ok( res == STATUS_SUCCESS, "setting the end of file failed, res %lx\n", res );
+    if (sparse_test_query( h, &eof, &alloc, __LINE__ ))
+    {
+        trace( "extended, sparse: eof %I64u alloc %I64u\n", eof, alloc );
+        ok( eof == size, "expected EndOfFile %I64u, got %I64u\n", size, eof );
+        ok( alloc == 0, "extending a sparse file: expected allocation 0, got %I64u\n", alloc );
+    }
+    CloseHandle( h );
+
+    /* real data written: allocated, as it always was */
+    if (!(h = create_temp_file(0))) return;
+    {
+        char *buffer = calloc( 1, size );
+        ok( buffer != NULL, "out of memory\n" );
+        ok( WriteFile( h, buffer, size, &count, NULL ) && count == size, "write failed\n" );
+        free( buffer );
+    }
+    if (sparse_test_query( h, &eof, &alloc, __LINE__ ))
+    {
+        trace( "written in full: eof %I64u alloc %I64u\n", eof, alloc );
+        ok( eof == size, "expected EndOfFile %I64u, got %I64u\n", size, eof );
+        ok( alloc == size, "a fully written file: expected allocation %I64u, got %I64u\n", size, alloc );
+    }
+    CloseHandle( h );
+
+    /* A sparse file with a single byte written just below the end.  Windows
+     * reports more than one cluster here, for reasons this test does not try to
+     * pin down; all that is checked is that something was allocated and that it
+     * is a whole number of clusters. */
+    if (!(h = create_temp_file(0))) return;
+    mark_sparse( h, __LINE__ );
+    ok( SetFilePointer( h, size - 1, NULL, FILE_BEGIN ) == size - 1, "seek failed\n" );
+    ok( WriteFile( h, &c, 1, &count, NULL ) && count == 1, "write failed\n" );
+    if (sparse_test_query( h, &eof, &alloc, __LINE__ ))
+    {
+        trace( "sparse, one byte at the end: eof %I64u alloc %I64u\n", eof, alloc );
+        ok( eof == size, "expected EndOfFile %I64u, got %I64u\n", size, eof );
+        ok( alloc >= cluster && !(alloc % cluster),
+            "one byte in a sparse file: expected whole clusters, got %I64u\n", alloc );
+    }
+    CloseHandle( h );
+}
+
 static void test_file_basic_information(void)
 {
     FILE_BASIC_INFORMATION fbi, fbi2;
@@ -7678,6 +7791,7 @@ START_TEST(file)
     test_file_name_information();
     test_file_full_size_information();
     test_file_allocation_information();
+    test_file_sparse_allocation();
     test_file_all_name_information();
     test_file_rename_information(FileRenameInformation);
     test_file_rename_information(FileRenameInformationEx);

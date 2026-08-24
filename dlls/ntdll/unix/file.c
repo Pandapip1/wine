@@ -186,6 +186,11 @@ typedef struct
 
 #define XATTR_REPARSE XATTR_USER_PREFIX "WINEREPARSE"
 
+/* A Windows file is not sparse unless it has been explicitly marked so with
+ * FSCTL_SET_SPARSE, while a Unix file extended with ftruncate() always has a
+ * hole.  The mark is remembered here so that the two can be told apart. */
+#define XATTR_SPARSE XATTR_USER_PREFIX "WINESPARSE"
+
 struct file_identity
 {
     dev_t dev;
@@ -517,6 +522,35 @@ static int xattr_get_at( int root_fd, const char *path, const char *name, void *
     ret = xattr_fget( fd, name, value, size );
     close( fd );
     return ret;
+}
+
+
+/* check whether the file has been explicitly marked sparse with FSCTL_SET_SPARSE */
+static BOOL is_sparse_file( int fd )
+{
+    char dummy;
+
+    return xattr_fget( fd, XATTR_SPARSE, &dummy, sizeof(dummy) ) >= 0;
+}
+
+
+/* Reserve real disk blocks for the whole file without moving its end of file,
+ * the way NTFS allocates clusters for a file that is not marked sparse.
+ * Filesystems that cannot do this keep the traditional Unix behaviour. */
+static NTSTATUS reserve_file_blocks( int fd, ULONGLONG size )
+{
+#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
+    if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, size ) == -1)
+    {
+        if (errno == EOPNOTSUPP || errno == ENOSYS || errno == EINVAL)
+        {
+            WARN( "fallocate not supported on this filesystem\n" );
+            return STATUS_SUCCESS;
+        }
+        return errno_to_status( errno );
+    }
+#endif
+    return STATUS_SUCCESS;
 }
 
 
@@ -5454,6 +5488,20 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         if (len >= sizeof(FILE_END_OF_FILE_INFORMATION))
         {
             const FILE_END_OF_FILE_INFORMATION *info = ptr;
+            struct stat st;
+
+            /* Extending a file that is not marked sparse allocates real clusters
+             * on Windows, which the allocation size then reports.  ftruncate()
+             * leaves a hole instead, so reserve the blocks here to match. */
+            if (info->EndOfFile.QuadPart > 0 &&
+                !server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
+            {
+                if (!fstat( fd, &st ) && S_ISREG( st.st_mode ) &&
+                    info->EndOfFile.QuadPart > st.st_size && !is_sparse_file( fd ))
+                    status = reserve_file_blocks( fd, info->EndOfFile.QuadPart );
+                if (needs_close) close( fd );
+                if (status) break;
+            }
 
             SERVER_START_REQ( set_fd_eof_info )
             {
@@ -7000,9 +7048,23 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     }
 
     case FSCTL_SET_SPARSE:
-        TRACE("FSCTL_SET_SPARSE: Ignoring request\n");
+    {
+        /* Sparseness itself is not modelled, but the mark has to be remembered:
+         * a file that carries it keeps the Unix hole behaviour when it is
+         * extended, and so reports an allocation size of its own. */
+        BOOLEAN set = TRUE;
+        int fd, needs_close;
+
+        if (in_size >= sizeof(BOOLEAN) && in_buffer) set = *(const BOOLEAN *)in_buffer;
+        if (!server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL ))
+        {
+            if (set) xattr_fset( fd, XATTR_SPARSE, "1", 1 );
+            else xattr_fremove( fd, XATTR_SPARSE );
+            if (needs_close) close( fd );
+        }
         status = STATUS_SUCCESS;
         break;
+    }
     default:
         return server_ioctl_file( handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
