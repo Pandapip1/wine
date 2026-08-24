@@ -2236,6 +2236,29 @@ done:
 }
 #endif
 
+/* Return the filesystem's allocation unit ("cluster") size for an open file.
+ * Windows rounds FileAllocationInformation requests up to this granularity, so
+ * it has to be discovered at runtime rather than assumed. */
+static NTSTATUS get_file_cluster_size( int fd, ULONGLONG *size )
+{
+#if !defined(linux) || !defined(HAVE_FSTATFS)
+    struct statvfs stfs;
+
+    if (fstatvfs( fd, &stfs ) < 0) return errno_to_status( errno );
+    if (!stfs.f_frsize && !stfs.f_bsize) return STATUS_NOT_IMPLEMENTED;
+    *size = stfs.f_frsize ? stfs.f_frsize : stfs.f_bsize;
+#else
+    struct statfs stfs;
+
+    /* Linux's fstatvfs is buggy */
+    if (fstatfs( fd, &stfs ) < 0) return errno_to_status( errno );
+    if (stfs.f_bsize <= 0) return STATUS_NOT_IMPLEMENTED;
+    *size = stfs.f_bsize;
+#endif
+    return STATUS_SUCCESS;
+}
+
+
 static NTSTATUS get_full_size_info(int fd, FILE_FS_FULL_SIZE_INFORMATION *info) {
     struct stat st;
     ULONGLONG bsize;
@@ -5358,6 +5381,70 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if (lseek( fd, info->CurrentByteOffset.QuadPart, SEEK_SET ) == (off_t)-1)
                 status = errno_to_status( errno );
 
+            if (needs_close) close( fd );
+        }
+        else status = STATUS_INVALID_PARAMETER_3;
+        break;
+
+    case FileAllocationInformation:
+        if (len >= sizeof(FILE_ALLOCATION_INFORMATION))
+        {
+            const FILE_ALLOCATION_INFORMATION *info = ptr;
+            ULONGLONG cluster_size = 0, alloc;
+            struct stat st;
+
+            if (info->AllocationSize.QuadPart < 0)
+            {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL )))
+                return io->Status = status;
+
+            if (fstat( fd, &st ) == -1) status = errno_to_status( errno );
+            else if (!S_ISREG( st.st_mode )) status = STATUS_INVALID_DEVICE_REQUEST;
+            else if (!(status = get_file_cluster_size( fd, &cluster_size )))
+            {
+                if ((ULONGLONG)info->AllocationSize.QuadPart > MAXLONGLONG - (cluster_size - 1))
+                    status = STATUS_INVALID_PARAMETER;
+                else
+                {
+                    /* Windows rounds the requested allocation up to a whole number of
+                     * clusters. If the result lands below the current end of file the
+                     * file is truncated to it; otherwise the file size is left alone
+                     * and only the allocation grows. */
+                    alloc = ((ULONGLONG)info->AllocationSize.QuadPart + cluster_size - 1) / cluster_size * cluster_size;
+
+                    if (alloc < (ULONGLONG)st.st_size)
+                    {
+                        SERVER_START_REQ( set_fd_eof_info )
+                        {
+                            req->handle = wine_server_obj_handle( handle );
+                            req->eof    = alloc;
+                            status = wine_server_call( req );
+                        }
+                        SERVER_END_REQ;
+                    }
+                    else if (alloc > (ULONGLONG)st.st_blocks * 512)
+                    {
+#if defined(__linux__) && defined(FALLOC_FL_KEEP_SIZE)
+                        /* reserve the blocks for real, without moving the end of file */
+                        if (fallocate( fd, FALLOC_FL_KEEP_SIZE, 0, alloc ) == -1)
+                        {
+                            if (errno == EOPNOTSUPP || errno == ENOSYS)
+                            {
+                                WARN( "fallocate not supported on this filesystem\n" );
+                                status = STATUS_NOT_IMPLEMENTED;
+                            }
+                            else status = errno_to_status( errno );
+                        }
+#else
+                        WARN( "setting the allocation size is not supported on this platform\n" );
+                        status = STATUS_NOT_IMPLEMENTED;
+#endif
+                    }
+                }
+            }
             if (needs_close) close( fd );
         }
         else status = STATUS_INVALID_PARAMETER_3;

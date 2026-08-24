@@ -1441,6 +1441,213 @@ static void test_file_full_size_information(void)
     CloseHandle( h );
 }
 
+/* Bring the file to the given size, backed by real data.  The size is not set
+ * with FileEndOfFileInformation alone: that would leave a hole, and a sparse
+ * file has an allocation of its own that has nothing to do with its size,
+ * which is exactly what these tests are trying to observe. */
+static void alloc_test_set_size( HANDLE h, ULONGLONG size, int line )
+{
+    FILE_END_OF_FILE_INFORMATION feof;
+    FILE_STANDARD_INFORMATION fsi;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+    char *buffer;
+    DWORD count;
+
+    feof.EndOfFile.QuadPart = 0;
+    res = pNtSetInformationFile( h, &io, &feof, sizeof(feof), FileEndOfFileInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "emptying the file failed, res %lx\n", res );
+
+    if (size)
+    {
+        buffer = calloc( 1, size );
+        ok_(__FILE__, line)( buffer != NULL, "out of memory\n" );
+        ok_(__FILE__, line)( SetFilePointer( h, 0, NULL, FILE_BEGIN ) == 0, "seek failed\n" );
+        ok_(__FILE__, line)( WriteFile( h, buffer, size, &count, NULL ) && count == size,
+                             "writing %s bytes failed\n", wine_dbgstr_longlong(size) );
+        free( buffer );
+    }
+
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying size failed, res %lx\n", res );
+    ok_(__FILE__, line)( fsi.EndOfFile.QuadPart == size, "setup: expected size %s, got %s\n",
+                         wine_dbgstr_longlong(size), wine_dbgstr_longlong(fsi.EndOfFile.QuadPart) );
+}
+
+/* Run one row of the FileAllocationInformation table: start the file at
+ * initial_size, request an allocation of request, expect the end of file to
+ * end up at expect_size. */
+static void alloc_test_row( HANDLE h, ULONGLONG initial_size, ULONGLONG request,
+                            ULONGLONG expect_size, int line )
+{
+    FILE_ALLOCATION_INFORMATION fai;
+    FILE_STANDARD_INFORMATION before, after;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+
+    alloc_test_set_size( h, initial_size, line );
+
+    res = pNtQueryInformationFile( h, &io, &before, sizeof(before), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+
+    fai.AllocationSize.QuadPart = request;
+    res = pNtSetInformationFile( h, &io, &fai, sizeof(fai), FileAllocationInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS,
+                         "initial %s request %s: NtSetInformationFile returned %lx\n",
+                         wine_dbgstr_longlong(initial_size), wine_dbgstr_longlong(request), res );
+    if (res) return;
+
+    res = pNtQueryInformationFile( h, &io, &after, sizeof(after), FileStandardInformation );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+
+    trace( "eof %I64u alloc %I64u + request %I64u -> eof %I64u alloc %I64u\n",
+           before.EndOfFile.QuadPart, before.AllocationSize.QuadPart, request,
+           after.EndOfFile.QuadPart, after.AllocationSize.QuadPart );
+
+    ok_(__FILE__, line)( after.EndOfFile.QuadPart == expect_size,
+                         "initial %s request %s: expected EndOfFile %s, got %s\n",
+                         wine_dbgstr_longlong(initial_size), wine_dbgstr_longlong(request),
+                         wine_dbgstr_longlong(expect_size),
+                         wine_dbgstr_longlong(after.EndOfFile.QuadPart) );
+    /* the allocation must always cover the end of file */
+    ok_(__FILE__, line)( after.AllocationSize.QuadPart >= after.EndOfFile.QuadPart,
+                         "initial %s request %s: allocation %s is below EndOfFile %s\n",
+                         wine_dbgstr_longlong(initial_size), wine_dbgstr_longlong(request),
+                         wine_dbgstr_longlong(after.AllocationSize.QuadPart),
+                         wine_dbgstr_longlong(after.EndOfFile.QuadPart) );
+}
+
+static void test_file_allocation_information(void)
+{
+    FILE_ALLOCATION_INFORMATION fai;
+    FILE_STANDARD_INFORMATION fsi;
+    FILE_FS_SIZE_INFORMATION fssi;
+    IO_STATUS_BLOCK io;
+    ULONGLONG cluster;
+    char *buffer;
+    DWORD count;
+    HANDLE h;
+    NTSTATUS res;
+    ULONG i;
+
+    if (!(h = create_temp_file(0))) return;
+
+    /* The rounding granularity is the volume's allocation unit, which has to be
+     * discovered at runtime -- it is not always 4096. */
+    res = pNtQueryVolumeInformationFile( h, &io, &fssi, sizeof(fssi), FileFsSizeInformation );
+    ok( res == STATUS_SUCCESS, "cannot get volume size info, res %lx\n", res );
+    if (res)
+    {
+        CloseHandle( h );
+        return;
+    }
+    cluster = (ULONGLONG)fssi.BytesPerSector * fssi.SectorsPerAllocationUnit;
+    ok( cluster != 0, "bad cluster size\n" );
+    if (!cluster)
+    {
+        CloseHandle( h );
+        return;
+    }
+    trace( "allocation unit is %s bytes\n", wine_dbgstr_longlong(cluster) );
+
+    /* An empty file asked for one cluster: the allocation grows but the end of
+     * file must stay at 0.  An end-of-file style implementation grows the file
+     * to one cluster here, which is wrong. */
+    alloc_test_set_size( h, 0, __LINE__ );
+    fai.AllocationSize.QuadPart = cluster;
+    res = pNtSetInformationFile( h, &io, &fai, sizeof(fai), FileAllocationInformation );
+    ok( res == STATUS_SUCCESS, "NtSetInformationFile returned %lx\n", res );
+    if (res == STATUS_NOT_IMPLEMENTED || res == STATUS_INVALID_INFO_CLASS)
+    {
+        win_skip( "FileAllocationInformation is not implemented\n" );
+        CloseHandle( h );
+        return;
+    }
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+    trace( "eof 0 alloc 0 + request %I64u -> eof %I64u alloc %I64u\n",
+           cluster, fsi.EndOfFile.QuadPart, fsi.AllocationSize.QuadPart );
+    ok( fsi.EndOfFile.QuadPart == 0, "initial 0 request one cluster: expected EndOfFile 0, got %s\n",
+        wine_dbgstr_longlong(fsi.EndOfFile.QuadPart) );
+    ok( fsi.AllocationSize.QuadPart >= cluster,
+        "initial 0 request one cluster: expected allocation of at least %s, got %s\n",
+        wine_dbgstr_longlong(cluster), wine_dbgstr_longlong(fsi.AllocationSize.QuadPart) );
+
+    /* a small file asked for one cluster keeps its size and gains the allocation */
+    alloc_test_row( h, 64, cluster, 64, __LINE__ );
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+    ok( fsi.AllocationSize.QuadPart >= cluster,
+        "initial 64 request one cluster: expected allocation of at least %s, got %s\n",
+        wine_dbgstr_longlong(cluster), wine_dbgstr_longlong(fsi.AllocationSize.QuadPart) );
+
+    /* A one-cluster file asked for a tiny allocation is left completely alone,
+     * because the request rounds back up to one cluster.  This is the row that
+     * separates a correct implementation from one that writes the request
+     * straight to the end of file and destroys the tail of the file. */
+    if (cluster > 100)
+        alloc_test_row( h, cluster, 100, cluster, __LINE__ );
+
+    /* the same row again, this time checking that the data really survives */
+    if (cluster > 100)
+    {
+        buffer = malloc( cluster );
+        for (i = 0; i < cluster; i++) buffer[i] = (char)(i * 7 + 3);
+        alloc_test_set_size( h, 0, __LINE__ );
+        ok( SetFilePointer( h, 0, NULL, FILE_BEGIN ) == 0, "seek failed\n" );
+        ok( WriteFile( h, buffer, cluster, &count, NULL ) && count == cluster, "write failed\n" );
+        fai.AllocationSize.QuadPart = 100;
+        res = pNtSetInformationFile( h, &io, &fai, sizeof(fai), FileAllocationInformation );
+        ok( res == STATUS_SUCCESS, "NtSetInformationFile returned %lx\n", res );
+        memset( buffer, 0, cluster );
+        ok( SetFilePointer( h, 0, NULL, FILE_BEGIN ) == 0, "seek failed\n" );
+        ok( ReadFile( h, buffer, cluster, &count, NULL ), "read failed\n" );
+        ok( count == cluster, "expected to read back %s bytes, got %ld\n",
+            wine_dbgstr_longlong(cluster), count );
+        for (i = 0; i < count; i++)
+        {
+            if (buffer[i] != (char)(i * 7 + 3))
+            {
+                ok( 0, "file contents damaged at offset %lu\n", i );
+                break;
+            }
+        }
+        free( buffer );
+    }
+
+    /* asking for nothing truncates the file away */
+    alloc_test_row( h, cluster, 0, 0, __LINE__ );
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+    ok( fsi.AllocationSize.QuadPart == 0, "initial one cluster request 0: expected allocation 0, got %s\n",
+        wine_dbgstr_longlong(fsi.AllocationSize.QuadPart) );
+
+    /* the discriminating rows: a four-cluster file asked for less than it has
+     * is truncated down to the rounded-up request */
+    alloc_test_row( h, cluster * 4, 100, cluster, __LINE__ );
+    alloc_test_row( h, cluster * 4, cluster * 2, cluster * 2, __LINE__ );
+
+    /* asking for exactly what is already there changes nothing */
+    alloc_test_row( h, cluster * 4, cluster * 4, cluster * 4, __LINE__ );
+
+    /* a negative allocation is rejected */
+    alloc_test_set_size( h, cluster, __LINE__ );
+    fai.AllocationSize.QuadPart = -1;
+    res = pNtSetInformationFile( h, &io, &fai, sizeof(fai), FileAllocationInformation );
+    ok( res == STATUS_INVALID_PARAMETER, "expected STATUS_INVALID_PARAMETER, got %lx\n", res );
+    res = pNtQueryInformationFile( h, &io, &fsi, sizeof(fsi), FileStandardInformation );
+    ok( res == STATUS_SUCCESS, "querying standard info failed, res %lx\n", res );
+    ok( fsi.EndOfFile.QuadPart == cluster, "a rejected request must not change the file, got %s\n",
+        wine_dbgstr_longlong(fsi.EndOfFile.QuadPart) );
+
+    /* a short buffer is rejected */
+    res = pNtSetInformationFile( h, &io, &fai, sizeof(fai) - 1, FileAllocationInformation );
+    ok( res == STATUS_INFO_LENGTH_MISMATCH || res == STATUS_INVALID_PARAMETER_3,
+        "expected a length failure, got %lx\n", res );
+
+    CloseHandle( h );
+}
+
 static void test_file_basic_information(void)
 {
     FILE_BASIC_INFORMATION fbi, fbi2;
@@ -7470,6 +7677,7 @@ START_TEST(file)
     test_file_both_information();
     test_file_name_information();
     test_file_full_size_information();
+    test_file_allocation_information();
     test_file_all_name_information();
     test_file_rename_information(FileRenameInformation);
     test_file_rename_information(FileRenameInformationEx);
