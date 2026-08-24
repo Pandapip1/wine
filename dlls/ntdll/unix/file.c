@@ -5033,6 +5033,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     unsigned int reparse_tag;
     unsigned int options;
     unsigned int status;
+    unsigned int required_access = 0;
 
     TRACE( "(%p,%p,%p,0x%08x,0x%08x)\n", handle, io, ptr, len, class);
 
@@ -5046,6 +5047,45 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         return server_get_file_info( handle, io, ptr, len, class );
     if (len < info_sizes[class])
         return io->Status = STATUS_INFO_LENGTH_MISMATCH;
+
+    /* On real NT, ObReferenceObjectByHandle() checks the handle's granted access
+     * against IopQueryOperationAccess[FileInformationClass] before the query is
+     * even dispatched (see ReactOS ntoskrnl/io/iomgr/iofunc.c NtQueryInformationFile()
+     * and the table in ntoskrnl/include/internal/io_i.h). FILE_READ_ATTRIBUTES is
+     * required for FileBasicInformation (that table also requires it for
+     * FileAllInformation, FileNetworkOpenInformation and FileAttributeTagInformation,
+     * but those are deliberately left unchecked here for now). Wine didn't enforce
+     * this at all.
+     *
+     * The check is done against a fresh access mask fetched straight from the
+     * server (get_object_info), not via server_get_unix_fd()'s wanted_access
+     * mechanism: that mechanism is backed by a fd cache whose access field is
+     * only a 3-bit bitfield wide enough for FILE_{READ,WRITE}_DATA/APPEND_DATA,
+     * so FILE_READ_ATTRIBUTES (0x80) can't survive a round trip through it. */
+    switch (class)
+    {
+    case FileBasicInformation:
+        required_access = FILE_READ_ATTRIBUTES;
+        break;
+    default:
+        break;
+    }
+
+    if (required_access)
+    {
+        unsigned int granted_access = 0;
+
+        SERVER_START_REQ( get_object_info )
+        {
+            req->handle = wine_server_obj_handle( handle );
+            status = wine_server_call( req );
+            if (!status) granted_access = reply->access;
+        }
+        SERVER_END_REQ;
+        if (status) return io->Status = status;
+        if ((granted_access & required_access) != required_access)
+            return io->Status = STATUS_ACCESS_DENIED;
+    }
 
     if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, &options )))
     {
