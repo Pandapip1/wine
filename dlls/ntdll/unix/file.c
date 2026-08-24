@@ -5231,7 +5231,12 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
             if (atime.QuadPart || mtime.QuadPart)
                 status = set_file_times( fd, &mtime, &atime );
 
-            if (status == STATUS_SUCCESS)
+            /* FILE_BASIC_INFORMATION is documented to leave an attribute
+             * unchanged when the corresponding field is 0, matching how
+             * the times above are already skipped when zero. Real NT
+             * honors that for FileAttributes too; only touch the on-disk
+             * attributes when the caller actually asked to set some. */
+            if (status == STATUS_SUCCESS && info->FileAttributes)
                 status = fd_set_file_info( fd, info->FileAttributes,
                                            unix_name && is_hidden_file( unix_name ));
 
