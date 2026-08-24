@@ -863,10 +863,15 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         if (!is_machine_32bit( nt.FileHeader.Machine )) return STATUS_INVALID_IMAGE_FORMAT;
         if (!is_machine_supported( nt.FileHeader.Machine )) return STATUS_INVALID_IMAGE_FORMAT;
 
+        /* real Windows rejects a sub-page SectionAlignment on every architecture,
+         * including x86/i386, with STATUS_INVALID_IMAGE_FORMAT (-> ERROR_BAD_EXE_FORMAT) --
+         * even though the PE/COFF spec explicitly permits it when FileAlignment matches.
+         * Measured on Windows 11 Pro 22621. */
+        if (nt.opt.hdr32.SectionAlignment & page_mask)
+            return STATUS_INVALID_IMAGE_FORMAT;
+
         if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_I386)  /* non-x86 platforms are more strict */
         {
-            if (nt.opt.hdr32.SectionAlignment & page_mask)
-                return STATUS_INVALID_IMAGE_FORMAT;
             if (!(nt.opt.hdr32.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT))
                 return STATUS_INVALID_IMAGE_FORMAT;
             if (!(nt.opt.hdr32.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
@@ -898,10 +903,12 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
         if (!is_machine_64bit( nt.FileHeader.Machine )) return STATUS_INVALID_IMAGE_FORMAT;
         if (!is_machine_supported( nt.FileHeader.Machine )) return STATUS_INVALID_IMAGE_FORMAT;
 
+        /* see the matching comment in the 32-bit case above */
+        if (nt.opt.hdr64.SectionAlignment & page_mask)
+            return STATUS_INVALID_IMAGE_FORMAT;
+
         if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)  /* non-x86 platforms are more strict */
         {
-            if (nt.opt.hdr64.SectionAlignment & page_mask)
-                return STATUS_INVALID_IMAGE_FORMAT;
             if (!(nt.opt.hdr64.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT))
                 return STATUS_INVALID_IMAGE_FORMAT;
             if (!(nt.opt.hdr64.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
