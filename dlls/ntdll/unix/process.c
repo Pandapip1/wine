@@ -1248,14 +1248,36 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
                 else if (!handle) ret = STATUS_INVALID_HANDLE;
                 else
                 {
-                    long ticks = sysconf(_SC_CLK_TCK);
-                    struct tms tms;
-
-                    /* FIXME: user/kernel times only work for current process */
-                    if (ticks && times( &tms ) != -1)
+                    if (handle == GetCurrentProcess())
                     {
-                        pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
-                        pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
+                        long ticks = sysconf(_SC_CLK_TCK);
+                        struct tms tms;
+
+                        if (ticks && times( &tms ) != -1)
+                        {
+                            pti.UserTime.QuadPart = (ULONGLONG)tms.tms_utime * 10000000 / ticks;
+                            pti.KernelTime.QuadPart = (ULONGLONG)tms.tms_stime * 10000000 / ticks;
+                        }
+                    }
+                    else
+                    {
+                        /* Ask the server, which reads the subject process's own times while
+                         * it runs and keeps the totals it captured when it exited.  When it
+                         * has no answer it reports zero and we pass that on: a zero is
+                         * recognisable as "unknown", whereas falling back to the calling
+                         * process's times -- which is what this did for every handle -- gives
+                         * a plausible number belonging to the wrong process that nothing
+                         * downstream can detect. */
+                        SERVER_START_REQ(get_process_cpu_times)
+                        {
+                            req->handle = wine_server_obj_handle( handle );
+                            if (!wine_server_call( req ))
+                            {
+                                pti.UserTime.QuadPart = reply->user_time;
+                                pti.KernelTime.QuadPart = reply->kernel_time;
+                            }
+                        }
+                        SERVER_END_REQ;
                     }
 
                     SERVER_START_REQ(get_process_info)

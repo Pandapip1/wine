@@ -1387,6 +1387,20 @@ struct get_process_vm_counters_reply
 
 
 
+struct get_process_cpu_times_request
+{
+    struct request_header __header;
+    obj_handle_t handle;
+};
+struct get_process_cpu_times_reply
+{
+    struct reply_header __header;
+    timeout_t    user_time;
+    timeout_t    kernel_time;
+};
+
+
+
 struct set_process_info_request
 {
     struct request_header __header;
@@ -6290,6 +6304,7 @@ enum request
     REQ_get_process_debug_info,
     REQ_get_process_image_name,
     REQ_get_process_vm_counters,
+    REQ_get_process_cpu_times,
     REQ_set_process_info,
     REQ_get_thread_info,
     REQ_get_thread_times,
@@ -6606,6 +6621,7 @@ union generic_request
     struct get_process_debug_info_request get_process_debug_info_request;
     struct get_process_image_name_request get_process_image_name_request;
     struct get_process_vm_counters_request get_process_vm_counters_request;
+    struct get_process_cpu_times_request get_process_cpu_times_request;
     struct set_process_info_request set_process_info_request;
     struct get_thread_info_request get_thread_info_request;
     struct get_thread_times_request get_thread_times_request;
@@ -6920,6 +6936,7 @@ union generic_reply
     struct get_process_debug_info_reply get_process_debug_info_reply;
     struct get_process_image_name_reply get_process_image_name_reply;
     struct get_process_vm_counters_reply get_process_vm_counters_reply;
+    struct get_process_cpu_times_reply get_process_cpu_times_reply;
     struct set_process_info_reply set_process_info_reply;
     struct get_thread_info_reply get_thread_info_reply;
     struct get_thread_times_reply get_thread_times_reply;
@@ -7217,6 +7234,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 964
+#define SERVER_PROTOCOL_VERSION 965
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

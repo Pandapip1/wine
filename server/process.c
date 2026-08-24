@@ -96,6 +96,7 @@ static void process_poll_event( struct fd *fd, int event );
 static struct list *process_get_kernel_obj_list( struct object *obj );
 static void process_destroy( struct object *obj );
 static void terminate_process( struct process *process, struct thread *skip, int exit_code );
+static void capture_process_cpu_times( struct process *process );
 
 static const struct object_ops process_ops =
 {
@@ -686,6 +687,9 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->views );
 
     process->end_time = 0;
+    process->user_time = 0;
+    process->kernel_time = 0;
+    process->cpu_times_known = 0;
 
     if (sd && !default_set_sd( &process->obj, sd, OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                                DACL_SECURITY_INFORMATION | SACL_SECURITY_INFORMATION ))
@@ -912,6 +916,11 @@ static void terminate_process( struct process *process, struct thread *skip, int
 
     grab_object( process );  /* make sure it doesn't get freed when threads die */
     process->is_terminating = 1;
+    /* Snapshot the CPU totals while the Unix process is certainly still alive.  Every
+     * orderly exit reaches here (RtlExitUserProcess -> NtTerminateProcess), and so does
+     * every kill from another process, so this is what actually makes the totals outlive
+     * the process; the second read in process_killed() only refines it. */
+    capture_process_cpu_times( process );
 
 restart:
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
@@ -955,11 +964,68 @@ void kill_console_processes( struct thread *renderer, int exit_code )
     }
 }
 
+/* Read the CPU times a process has consumed so far from the OS.
+ *
+ * Returns 0 when they cannot be obtained -- an unknown Unix pid, a platform without
+ * /proc, or a Unix process that has already been reaped.  Callers must then report
+ * zero rather than substituting anything else: zero is recognisable as "not
+ * available", whereas a plausible-looking number belonging to another process (the
+ * caller's own times, say, which is what ntdll used to return for every handle) is
+ * indistinguishable from a real answer. */
+static int get_unix_process_times( int unix_pid, timeout_t *user, timeout_t *kernel )
+{
+#ifdef linux
+    char proc_path[32], buffer[512], *p;
+    unsigned long long utime, stime;
+    long clk_tck = sysconf( _SC_CLK_TCK );
+    int fd, count;
+
+    if (unix_pid == -1 || clk_tck <= 0) return 0;
+    snprintf( proc_path, sizeof(proc_path), "/proc/%u/stat", unix_pid );
+    if ((fd = open( proc_path, O_RDONLY )) == -1) return 0;
+    count = read( fd, buffer, sizeof(buffer) - 1 );
+    close( fd );
+    if (count <= 0) return 0;
+    buffer[count] = 0;
+    /* Fields 14 (utime) and 15 (stime) of /proc/pid/stat, in clock ticks.  The comm
+     * field can itself contain spaces and parentheses, so scan past its final ')'.
+     * For a thread group leader these are the whole process's totals, including
+     * threads that have already exited, and they stay readable while the Unix
+     * process is a zombie. */
+    if (!(p = strrchr( buffer, ')' ))) return 0;
+    if (sscanf( p + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu",
+                &utime, &stime ) != 2) return 0;
+    *user = (timeout_t)utime * TICKS_PER_SEC / clk_tck;
+    *kernel = (timeout_t)stime * TICKS_PER_SEC / clk_tck;
+    return 1;
+#else
+    /* No portable way to ask about another process; report nothing rather than
+     * something wrong.  See the comment above. */
+    return 0;
+#endif
+}
+
+/* snapshot a process's CPU totals, keeping any previous snapshot if this one fails */
+static void capture_process_cpu_times( struct process *process )
+{
+    timeout_t user, kernel;
+
+    if (!get_unix_process_times( process->unix_pid, &user, &kernel )) return;
+    process->user_time = user;
+    process->kernel_time = kernel;
+    process->cpu_times_known = 1;
+}
+
 /* a process has been killed (i.e. its last thread died) */
 static void process_killed( struct process *process )
 {
     assert( list_empty( &process->thread_list ));
     process->end_time = current_time;
+    /* Last chance to capture the totals: once the Unix process is reaped its /proc
+     * entry disappears and they are gone for good.  By now it is usually a zombie,
+     * which still carries accurate totals; if it has already been reaped we keep the
+     * snapshot taken in terminate_process(). */
+    capture_process_cpu_times( process );
     close_process_desktop( process );
     process->winstation = 0;
     process->desktop = 0;
@@ -1751,6 +1817,33 @@ DECL_HANDLER(get_process_vm_counters)
 #endif
     }
     else set_error( STATUS_ACCESS_DENIED );
+    release_object( process );
+}
+
+/* retrieve the CPU times consumed by a process */
+DECL_HANDLER(get_process_cpu_times)
+{
+    struct process *process = get_process_from_handle( req->handle, PROCESS_QUERY_LIMITED_INFORMATION );
+
+    if (!process) return;
+
+    /* While the process runs we read its current totals straight from the OS.  Once
+     * it is gone all that is left is the snapshot taken on the way out, and if even
+     * that could not be taken we report zero -- see get_unix_process_times(). */
+    if (process->end_time || !get_unix_process_times( process->unix_pid, &reply->user_time,
+                                                     &reply->kernel_time ))
+    {
+        if (process->cpu_times_known)
+        {
+            reply->user_time = process->user_time;
+            reply->kernel_time = process->kernel_time;
+        }
+        else
+        {
+            reply->user_time = 0;
+            reply->kernel_time = 0;
+        }
+    }
     release_object( process );
 }
 

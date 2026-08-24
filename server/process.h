@@ -57,6 +57,9 @@ struct process
     int                  user_threads;    /* number of user threads running in this process */
     timeout_t            start_time;      /* absolute time at process start */
     timeout_t            end_time;        /* absolute time at process end */
+    timeout_t            user_time;       /* user CPU time, captured on the way out */
+    timeout_t            kernel_time;     /* kernel CPU time, captured on the way out */
+    int                  cpu_times_known; /* were the CPU times above captured successfully? */
     affinity_t           affinity;        /* process affinity mask */
     int                  priority;        /* priority class */
     int                  base_priority;   /* base priority to calculate thread priority */

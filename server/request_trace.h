@@ -270,6 +270,17 @@ static void dump_get_process_vm_counters_reply( const struct get_process_vm_coun
     dump_uint64( ", peak_pagefile_usage=", &req->peak_pagefile_usage );
 }
 
+static void dump_get_process_cpu_times_request( const struct get_process_cpu_times_request *req )
+{
+    fprintf( stderr, " handle=%04x", req->handle );
+}
+
+static void dump_get_process_cpu_times_reply( const struct get_process_cpu_times_reply *req )
+{
+    dump_timeout( " user_time=", &req->user_time );
+    dump_timeout( ", kernel_time=", &req->kernel_time );
+}
+
 static void dump_set_process_info_request( const struct set_process_info_request *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
@@ -3569,6 +3580,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_debug_info_request,
     (dump_func)dump_get_process_image_name_request,
     (dump_func)dump_get_process_vm_counters_request,
+    (dump_func)dump_get_process_cpu_times_request,
     (dump_func)dump_set_process_info_request,
     (dump_func)dump_get_thread_info_request,
     (dump_func)dump_get_thread_times_request,
@@ -3882,6 +3894,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_process_debug_info_reply,
     (dump_func)dump_get_process_image_name_reply,
     (dump_func)dump_get_process_vm_counters_reply,
+    (dump_func)dump_get_process_cpu_times_reply,
     NULL,
     (dump_func)dump_get_thread_info_reply,
     (dump_func)dump_get_thread_times_reply,
@@ -4195,6 +4208,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_process_debug_info",
     "get_process_image_name",
     "get_process_vm_counters",
+    "get_process_cpu_times",
     "set_process_info",
     "get_thread_info",
     "get_thread_times",
@@ -4521,6 +4535,7 @@ static const struct
     { "DEVICE_NOT_READY",            STATUS_DEVICE_NOT_READY },
     { "DIRECTORY_NOT_EMPTY",         STATUS_DIRECTORY_NOT_EMPTY },
     { "DISK_FULL",                   STATUS_DISK_FULL },
+    { "EA_LIST_INCONSISTENT",        STATUS_EA_LIST_INCONSISTENT },
     { "ERROR_CLASS_ALREADY_EXISTS",  0xc0010000 | ERROR_CLASS_ALREADY_EXISTS },
     { "ERROR_CLASS_DOES_NOT_EXIST",  0xc0010000 | ERROR_CLASS_DOES_NOT_EXIST },
     { "ERROR_CLASS_HAS_WINDOWS",     0xc0010000 | ERROR_CLASS_HAS_WINDOWS },
