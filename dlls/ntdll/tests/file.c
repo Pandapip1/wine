@@ -4458,6 +4458,76 @@ static void test_file_name_information(void)
     HeapFree( GetProcessHeap(), 0, file_name );
 }
 
+
+/* NtCreateFile( FILE_CREATE ) against a name that already exists: NT validates
+ * FILE_NON_DIRECTORY_FILE against an existing directory before it reports the
+ * collision, but it does not perform the mirror-image check.  All five rows below
+ * were measured on Windows 11 Pro 22621 with an NTFS temp directory; only the
+ * first one differs from a plain STATUS_OBJECT_NAME_COLLISION.  The other four
+ * are controls - they must keep returning the collision.  Note the asymmetry is
+ * real: FILE_DIRECTORY_FILE against a plain file gives the collision and *not*
+ * STATUS_NOT_A_DIRECTORY, so do not "tidy" this table into a symmetric one. */
+static void test_create_file_collision_options(void)
+{
+    /* FILE_SYNCHRONOUS_IO_NONALERT requires SYNCHRONIZE in the access mask;
+     * without it every row below returns STATUS_INVALID_PARAMETER instead. */
+    static const ULONG base_options = FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
+    static const struct
+    {
+        BOOL      is_dir;
+        ULONG     options;
+        NTSTATUS  expect;
+        const char *desc;
+    } tests[] =
+    {
+        { TRUE,  FILE_NON_DIRECTORY_FILE, STATUS_FILE_IS_A_DIRECTORY,   "dir, non-directory" },
+        { TRUE,  0,                       STATUS_OBJECT_NAME_COLLISION, "dir, no flag" },
+        { TRUE,  FILE_DIRECTORY_FILE,     STATUS_OBJECT_NAME_COLLISION, "dir, directory" },
+        { FALSE, FILE_NON_DIRECTORY_FILE, STATUS_OBJECT_NAME_COLLISION, "file, non-directory" },
+        { FALSE, FILE_DIRECTORY_FILE,     STATUS_OBJECT_NAME_COLLISION, "file, directory" },
+    };
+    WCHAR tmp_path[MAX_PATH], path[MAX_PATH];
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nameW;
+    IO_STATUS_BLOCK io;
+    HANDLE handle;
+    NTSTATUS status;
+    unsigned int i;
+    BOOL ret;
+
+    GetTempPathW( MAX_PATH, tmp_path );
+
+    for (i = 0; i < ARRAY_SIZE(tests); i++)
+    {
+        winetest_push_context( "%u: %s", i, tests[i].desc );
+
+        GetTempFileNameW( tmp_path, L"cro", 0, path );
+        if (tests[i].is_dir)
+        {
+            DeleteFileW( path );
+            ret = CreateDirectoryW( path, NULL );
+            ok( ret, "failed to create directory, error %lu\n", GetLastError() );
+        }
+
+        ok( pRtlDosPathNameToNtPathName_U( path, &nameW, NULL, NULL ), "can't convert name\n" );
+        InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
+
+        handle = (HANDLE)0xdeadbeef;
+        io.Status = 0xdeadbeef;
+        status = pNtCreateFile( &handle, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL,
+                                FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                FILE_CREATE, base_options | tests[i].options, NULL, 0 );
+        ok( status == tests[i].expect, "got %08lx, expected %08lx\n", status, tests[i].expect );
+        if (!status) pNtClose( handle );
+
+        pRtlFreeUnicodeString( &nameW );
+        if (tests[i].is_dir) RemoveDirectoryW( path );
+        else DeleteFileW( path );
+
+        winetest_pop_context();
+    }
+}
+
 static void test_file_all_name_information(void)
 {
     WCHAR *file_name, *volume_prefix, *expected;
@@ -7858,6 +7928,7 @@ START_TEST(file)
     test_file_allocation_information();
     test_file_sparse_allocation();
     test_file_all_name_information();
+    test_create_file_collision_options();
     test_file_rename_information(FileRenameInformation);
     test_file_rename_information(FileRenameInformationEx);
     test_file_rename_information_ex();

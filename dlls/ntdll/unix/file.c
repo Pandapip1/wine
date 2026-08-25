@@ -3975,7 +3975,7 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
 
     status = lookup_unix_name( AT_FDCWD, attr, nt_name, nt_pos, &unix_name, unix_len,
                                pos, disposition, open_reparse, is_unix, reparse_count );
-    if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+    if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE || status == STATUS_OBJECT_NAME_COLLISION)
     {
         *unix_name_ret = unix_name;
     }
@@ -3994,7 +3994,9 @@ static NTSTATUS nt_to_unix_file_name_no_root( OBJECT_ATTRIBUTES *attr, UNICODE_S
  *
  * If disposition is not FILE_OPEN or FILE_OVERWRITE, the last path
  * element doesn't have to exist; in that case STATUS_NO_SUCH_FILE is
- * returned, but the unix name is still filled in properly.
+ * returned, but the unix name is still filled in properly.  The unix
+ * name is also filled in for STATUS_OBJECT_NAME_COLLISION, so that the
+ * caller can inspect the object that is in the way.
  */
 static NTSTATUS nt_to_unix_file_name( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name,
                                       char **name_ret, UINT disposition, BOOL open_reparse )
@@ -4034,7 +4036,7 @@ static NTSTATUS nt_to_unix_file_name( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
     }
     else if (status == STATUS_OBJECT_TYPE_MISMATCH) status = STATUS_BAD_DEVICE_TYPE;
 
-    if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE)
+    if (status == STATUS_SUCCESS || status == STATUS_NO_SUCH_FILE || status == STATUS_OBJECT_NAME_COLLISION)
     {
         TRACE( "%s -> %s\n", debugstr_us(attr->ObjectName), debugstr_a(unix_name) );
         *name_ret = unix_name;
@@ -4527,7 +4529,8 @@ static void remove_trailing_backslash( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *
  *
  * If disposition is not FILE_OPEN or FILE_OVERWRITE, the last path
  * element doesn't have to exist; in that case STATUS_NO_SUCH_FILE is
- * returned, but the names are still filled in properly.
+ * returned, but the names are still filled in properly.  The unix name
+ * is also filled in for STATUS_OBJECT_NAME_COLLISION.
  *
  * nt_name.Buffer and unix_name must be freed by caller in all cases.
  */
@@ -4852,6 +4855,26 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     {
         created = TRUE;
         status = STATUS_SUCCESS;
+    }
+
+    /* NT checks FILE_NON_DIRECTORY_FILE against the existing object *before* it reports
+     * the FILE_CREATE collision, but it does not perform the mirror-image check.  Measured
+     * on Windows 11 Pro 22621, NTFS, with NtCreateFile( disposition = FILE_CREATE ):
+     *
+     *   existing directory + FILE_NON_DIRECTORY_FILE -> c00000ba STATUS_FILE_IS_A_DIRECTORY
+     *   existing plain file + FILE_DIRECTORY_FILE    -> c0000035 STATUS_OBJECT_NAME_COLLISION
+     *
+     * i.e. the second case yields the collision, *not* STATUS_NOT_A_DIRECTORY.  A directory
+     * with no directory/non-directory flag, a directory with FILE_DIRECTORY_FILE and a plain
+     * file with FILE_NON_DIRECTORY_FILE all give the collision too.  This asymmetry is real
+     * and deliberate: do NOT add a FILE_DIRECTORY_FILE case here and do NOT unify the two
+     * checks into one "create options disagree with the existing object" test - only the
+     * FILE_NON_DIRECTORY_FILE check precedes the disposition check. */
+    if (status == STATUS_OBJECT_NAME_COLLISION && (options & FILE_NON_DIRECTORY_FILE) && unix_name)
+    {
+        struct stat st;
+
+        if (!stat( unix_name, &st ) && S_ISDIR( st.st_mode )) status = STATUS_FILE_IS_A_DIRECTORY;
     }
 
     if (status == STATUS_SUCCESS)
