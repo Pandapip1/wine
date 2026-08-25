@@ -21,3 +21,7 @@ jobs:
         if: always()
         shell: pwsh
         run: .github/probes/zero-data-buflen.ps1
+      - name: VHD / cluster-size capability
+        if: always()
+        shell: pwsh
+        run: .github/probes/vhd-capability.ps1
