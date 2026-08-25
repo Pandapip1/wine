@@ -101,6 +101,18 @@ function Cell([string]$tag, [bool]$sparse, [long]$size, [long]$off, [long]$beyon
   Write-Output ""
 }
 
+# --- Granularity: at what unit does NTFS actually deallocate? ---
+# The 64 KB/32 KB measurement showed no deallocation; the 1 MB/512 KB one did.
+# The obvious reconciliation is a 64 KB sparse allocation unit, deallocated only
+# when a whole unit is covered.  That is a HYPOTHESIS.  These cells discriminate
+# it from a 4 KB-cluster rule and from a "size of file" rule.
+Cell "gran-one-unit"   $true 1048576 65536  131072 "exactly one 64 KB-aligned unit: expect Alloc 1048576 -> 983040 if unit is 64 KB"
+Cell "gran-one-cluster" $true 1048576 4096   8192   "one 4 KB cluster: any dealloc means granularity is finer than 64 KB"
+Cell "gran-60k-aligned" $true 1048576 4096   65536  "60 KB ending on a unit boundary but not starting on one: dealloc => 4 KB rule"
+Cell "gran-misaligned"  $true 1048576 32768  98304  "64 KB long but straddling two units: dealloc => alignment does not matter"
+Cell "gran-partial-full-partial" $true 1048576 8192 122880 "covers NO whole 64 KB unit: expect no dealloc under the 64 KB rule"
+Cell "gran-two-units"   $true 1048576 65536  196608 "two whole units: expect Alloc -> 917504"
+
 # --- The refutation cells: does a LARGE, whole-range zero actually deallocate? ---
 # The prior measurement used a 32 KB partial range in a 64 KB file. If NTFS simply
 # declines to deallocate small runs, "never deallocates" is the wrong rule and a
