@@ -1316,6 +1316,15 @@ typedef volatile struct
 @END
 
 
+/* Retrieve the CPU times consumed by a process */
+@REQ(get_process_cpu_times)
+    obj_handle_t handle;       /* process handle */
+@REPLY
+    timeout_t    user_time;    /* user CPU time in 100-ns units */
+    timeout_t    kernel_time;  /* kernel CPU time in 100-ns units */
+@END
+
+
 /* Set a process information */
 @REQ(set_process_info)
     obj_handle_t handle;       /* process handle */
