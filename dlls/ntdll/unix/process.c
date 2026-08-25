@@ -607,9 +607,11 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
                 params->ConsoleHandle == NULL)
             {
                 setsid();
-                set_stdio_fd( -1, -1 );  /* close stdin and stdout */
             }
-            else set_stdio_fd( stdin_fd, stdout_fd );
+            /* the new session/process group only decides terminal ownership; it must
+             * not discard standard handles the caller actually supplied.  Handles the
+             * caller did not supply are still -1 here and fall back to /dev/null. */
+            set_stdio_fd( stdin_fd, stdout_fd );
 
             if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
             if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
