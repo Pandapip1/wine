@@ -1826,6 +1826,210 @@ static void test_file_sparse_allocation(void)
     CloseHandle( h );
 }
 
+/* FSCTL_SET_ZERO_DATA.  The rules checked here were measured on Windows Server
+ * 2025 (NTFS, 4 KB clusters); the granularity at which storage is released is
+ * 64 KB, not the cluster size, and only whole 64 KB-aligned units lying inside
+ * the range are given up. */
+#define ZERO_DATA_SIZE   0x100000
+#define ZERO_DATA_UNIT   0x10000
+
+static BOOL zero_data_fill( HANDLE h, char *pattern )
+{
+    DWORD count;
+    BOOL ret;
+
+    memset( pattern, 0xaa, ZERO_DATA_SIZE );
+    ret = WriteFile( h, pattern, ZERO_DATA_SIZE, &count, NULL ) && count == ZERO_DATA_SIZE;
+    ok( ret, "writing the initial pattern failed\n" );
+    return ret;
+}
+
+static NTSTATUS zero_data( HANDLE h, LONGLONG offset, LONGLONG beyond )
+{
+    FILE_ZERO_DATA_INFORMATION fzdi;
+    IO_STATUS_BLOCK io;
+
+    fzdi.FileOffset.QuadPart = offset;
+    fzdi.BeyondFinalZero.QuadPart = beyond;
+    return NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_SET_ZERO_DATA,
+                            &fzdi, sizeof(fzdi), NULL, 0 );
+}
+
+/* Check that [offset,beyond) reads back as zeroes and that everything else in
+ * the first ZERO_DATA_SIZE bytes still holds the 0xaa pattern. */
+static void zero_data_check_contents( HANDLE h, LONGLONG offset, LONGLONG beyond, int line )
+{
+    char *buffer = malloc( ZERO_DATA_SIZE );
+    LONGLONG i, bad_zero = -1, bad_data = -1;
+    DWORD count;
+
+    if (!buffer) return;
+    ok_(__FILE__, line)( SetFilePointer( h, 0, NULL, FILE_BEGIN ) == 0, "seek failed\n" );
+    ok_(__FILE__, line)( ReadFile( h, buffer, ZERO_DATA_SIZE, &count, NULL ) && count == ZERO_DATA_SIZE,
+                         "reading the file back failed\n" );
+    for (i = 0; i < ZERO_DATA_SIZE; i++)
+    {
+        if (i >= offset && i < beyond)
+        {
+            if (buffer[i] && bad_zero == -1) bad_zero = i;
+        }
+        else if ((unsigned char)buffer[i] != 0xaa && bad_data == -1) bad_data = i;
+    }
+    ok_(__FILE__, line)( bad_zero == -1, "byte %I64d in the zeroed range is %#x, expected 0\n",
+                         bad_zero, bad_zero == -1 ? 0 : (unsigned char)buffer[bad_zero] );
+    ok_(__FILE__, line)( bad_data == -1, "byte %I64d outside the zeroed range is %#x, expected 0xaa\n",
+                         bad_data, bad_data == -1 ? 0 : (unsigned char)buffer[bad_data] );
+    free( buffer );
+}
+
+static void test_file_set_zero_data(void)
+{
+    ULONGLONG eof, alloc, eof2, alloc2;
+    char *pattern;
+    NTSTATUS res;
+    HANDLE h;
+
+    if (!(pattern = malloc( ZERO_DATA_SIZE ))) return;
+
+    /* a file that has not been marked sparse: the bytes are zeroed where they
+     * are and no storage is released */
+    if ((h = create_temp_file(0)))
+    {
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, 0x40000, 0xc0000 );
+            ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
+            zero_data_check_contents( h, 0x40000, 0xc0000, __LINE__ );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+                ok( alloc2 == alloc, "a file that is not sparse: expected allocation %I64u, got %I64u\n",
+                    alloc, alloc2 );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* the same range on a file that has been marked sparse: the two whole 64 KB
+     * units inside [0x40000,0xc0000) are given back, which is the whole range
+     * here since both ends are already aligned */
+    if ((h = create_temp_file(0)))
+    {
+        mark_sparse( h, __LINE__ );
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, 0x40000, 0xc0000 );
+            ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
+            zero_data_check_contents( h, 0x40000, 0xc0000, __LINE__ );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                trace( "sparse zero data: eof %I64u alloc %I64u -> eof %I64u alloc %I64u\n",
+                       eof, alloc, eof2, alloc2 );
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+                /* the host filesystem may not be able to punch a hole at all, in
+                 * which case only the space saving is lost */
+                if (alloc2 == alloc)
+                    skip( "the filesystem does not release storage for a zeroed range\n" );
+                else
+                    ok( alloc - alloc2 == 0x80000,
+                        "zeroing 512 KB of a sparse file: expected %I64u released, got %I64u\n",
+                        (ULONGLONG)0x80000, alloc - alloc2 );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* a range that does not cover a whole 64 KB unit releases nothing, but the
+     * bytes still read back as zeroes */
+    if ((h = create_temp_file(0)))
+    {
+        mark_sparse( h, __LINE__ );
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, 0x1000, 0x2000 );
+            ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
+            zero_data_check_contents( h, 0x1000, 0x2000, __LINE__ );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+                ok( alloc2 == alloc,
+                    "a range covering no whole 64 KB unit: expected allocation %I64u, got %I64u\n",
+                    alloc, alloc2 );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* the range never extends the file: past the end, straddling it and starting
+     * exactly at it all succeed and change neither size */
+    if ((h = create_temp_file(0)))
+    {
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, ZERO_DATA_SIZE * 2, ZERO_DATA_SIZE * 3 );
+            ok( res == STATUS_SUCCESS, "a range past the end of file returned %lx\n", res );
+            res = zero_data( h, ZERO_DATA_SIZE, ZERO_DATA_SIZE + ZERO_DATA_UNIT );
+            ok( res == STATUS_SUCCESS, "a range starting at the end of file returned %lx\n", res );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+                ok( alloc2 == alloc, "expected allocation %I64u, got %I64u\n", alloc, alloc2 );
+            }
+            /* straddling the end of file: the part inside the file is zeroed and
+             * the file does not grow */
+            res = zero_data( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT, ZERO_DATA_SIZE * 2 );
+            ok( res == STATUS_SUCCESS, "a range straddling the end of file returned %lx\n", res );
+            zero_data_check_contents( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT, ZERO_DATA_SIZE, __LINE__ );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+        }
+        CloseHandle( h );
+    }
+
+    /* malformed ranges */
+    if ((h = create_temp_file(0)))
+    {
+        if (zero_data_fill( h, pattern ))
+        {
+            res = zero_data( h, 0x2000, 0x1000 );
+            ok( res == STATUS_INVALID_PARAMETER, "BeyondFinalZero below FileOffset returned %lx\n", res );
+            res = zero_data( h, -1, 0x1000 );
+            ok( res == STATUS_INVALID_PARAMETER, "a negative FileOffset returned %lx\n", res );
+            /* an empty range is a no-op, not an error */
+            res = zero_data( h, 0x1000, 0x1000 );
+            ok( res == STATUS_SUCCESS, "an empty range returned %lx\n", res );
+            zero_data_check_contents( h, 0, 0, __LINE__ );
+
+            /* malformed input buffers.  Measured: a length below the size of the
+             * structure fails, a length above it succeeds, and a null pointer
+             * fails whatever the length says. */
+            {
+                /* backed by more storage than is declared, so that a surplus
+                 * length never reads past the object */
+                char buffer[sizeof(FILE_ZERO_DATA_INFORMATION) + 8];
+                FILE_ZERO_DATA_INFORMATION * const pfzdi = (FILE_ZERO_DATA_INFORMATION *)buffer;
+                IO_STATUS_BLOCK io;
+
+                memset( buffer, 0, sizeof(buffer) );
+                pfzdi->FileOffset.QuadPart = 0x10000;
+                pfzdi->BeyondFinalZero.QuadPart = 0x20000;
+                res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_SET_ZERO_DATA,
+                                       buffer, sizeof(FILE_ZERO_DATA_INFORMATION) - 1, NULL, 0 );
+                ok( res == STATUS_INVALID_PARAMETER, "a short input length returned %lx\n", res );
+                res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_SET_ZERO_DATA,
+                                       NULL, sizeof(FILE_ZERO_DATA_INFORMATION), NULL, 0 );
+                ok( res == STATUS_INVALID_PARAMETER, "a null input buffer returned %lx\n", res );
+                res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_SET_ZERO_DATA,
+                                       buffer, sizeof(buffer), NULL, 0 );
+                ok( res == STATUS_SUCCESS, "a surplus input length returned %lx\n", res );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    free( pattern );
+}
+
 static void test_file_basic_information(void)
 {
     FILE_BASIC_INFORMATION fbi, fbi2;
@@ -7927,6 +8131,7 @@ START_TEST(file)
     test_file_full_size_information();
     test_file_allocation_information();
     test_file_sparse_allocation();
+    test_file_set_zero_data();
     test_file_all_name_information();
     test_create_file_collision_options();
     test_file_rename_information(FileRenameInformation);

@@ -607,6 +607,94 @@ static NTSTATUS shrink_file_allocation( int fd, off_t size, ULONGLONG alloc )
 }
 
 
+/* Write zeroes over a range of a file without moving its end of file.  The
+ * range is walked with a small buffer so that zeroing a large range does not
+ * need a buffer as large as the range itself. */
+static NTSTATUS write_file_zeros( int fd, off_t pos, off_t end )
+{
+    char zeros[0x1000];
+    ssize_t ret;
+
+    memset( zeros, 0, sizeof(zeros) );
+    while (pos < end)
+    {
+        size_t len = min( sizeof(zeros), (size_t)(end - pos) );
+
+        if ((ret = pwrite( fd, zeros, len, pos )) == -1)
+        {
+            if (errno == EINTR) continue;
+            return errno_to_status( errno );
+        }
+        pos += ret;
+    }
+    return STATUS_SUCCESS;
+}
+
+
+/* The unit of storage NTFS gives up when a range of a sparse file is zeroed.
+ * Measured on Windows Server 2025 (NTFS, 4 KB clusters): a hole appears only
+ * where a whole 64 KB-aligned unit lies inside the range.  Zeroing one 4 KB
+ * cluster, or 60 KB ending on a 64 KB boundary, or a full 64 KB straddling two
+ * units, all left the allocation size untouched; zeroing [65536,131072) gave
+ * back exactly 64 KB.  So it is the alignment of the unit that matters, not the
+ * length of the range and not the cluster size. */
+#define ZERO_DATA_GRANULARITY  0x10000
+
+/* Implement FSCTL_SET_ZERO_DATA over [offset,end).
+ *
+ * Measured on Windows Server 2025: the range never extends the file.  A range
+ * past the end of file, one straddling it, and one starting exactly at it all
+ * succeed and leave both the end of file and the allocation size alone, so the
+ * range is clamped to the current size and an empty result is simply a no-op.
+ *
+ * A file that this fork has not marked sparse (see XATTR_SPARSE) keeps all of
+ * its blocks: measured, the allocation size and the extent list of an unmarked
+ * file were unchanged by zeroing a range in the middle of it, so the bytes are
+ * only written over. */
+static NTSTATUS set_zero_data( int fd, LONGLONG offset, LONGLONG beyond_final_zero )
+{
+    struct stat st;
+    off_t pos, end;
+
+    if (offset < 0 || beyond_final_zero < offset) return STATUS_INVALID_PARAMETER;
+    if (fstat( fd, &st ) == -1) return errno_to_status( errno );
+
+    pos = offset;
+    end = beyond_final_zero;
+    if (end > st.st_size) end = st.st_size;
+    if (pos >= end) return STATUS_SUCCESS;
+
+    if (is_sparse_file( fd ))
+    {
+#if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
+        off_t lo = (pos + ZERO_DATA_GRANULARITY - 1) & ~(off_t)(ZERO_DATA_GRANULARITY - 1);
+        off_t hi = end & ~(off_t)(ZERO_DATA_GRANULARITY - 1);
+
+        if (lo < hi)
+        {
+            if (fallocate( fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, lo, hi - lo ) != -1)
+            {
+                NTSTATUS status;
+
+                /* a punched hole reads back as zeroes, so only the partial units
+                 * at either end are left to write over */
+                if ((status = write_file_zeros( fd, pos, lo ))) return status;
+                return write_file_zeros( fd, hi, end );
+            }
+            if (errno != EOPNOTSUPP && errno != ENOSYS) return errno_to_status( errno );
+            /* A filesystem that cannot punch still owes the caller the part of
+             * the contract that is visible in the data: those bytes must read as
+             * zero.  Write them and report success, losing only the space saving.
+             * That differs from reserve_file_blocks_strict(), where the caller
+             * asked for allocation itself and would be misled by success. */
+            WARN( "punching a hole is not supported on this filesystem\n" );
+        }
+#endif
+    }
+    return write_file_zeros( fd, pos, end );
+}
+
+
 
 /* get space from the current directory data buffer, allocating a new one if necessary */
 static void *get_dir_data_space( struct dir_data *data, unsigned int size )
@@ -7132,6 +7220,31 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
             if (needs_close) close( fd );
         }
         status = STATUS_SUCCESS;
+        break;
+    }
+
+    case FSCTL_SET_ZERO_DATA:
+    {
+        const FILE_ZERO_DATA_INFORMATION *info = in_buffer;
+        int fd, needs_close;
+
+        /* Measured on Windows Server 2025: a declared length below the size of
+         * the structure is STATUS_INVALID_PARAMETER, not a length mismatch, and
+         * so is a null pointer with a valid length -- NT rejects the request
+         * before dereferencing it, so no fault handling is needed here.  A
+         * length larger than the structure succeeds, so this must stay a "less
+         * than" test: a caller passing the size of a wrapper structure is a real
+         * pattern.  A short buffer and a short declared length behave the same,
+         * so NT does not read past the declared length either. */
+        if (in_size < sizeof(*info) || !in_buffer)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if ((status = server_get_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL )))
+            break;
+        status = set_zero_data( fd, info->FileOffset.QuadPart, info->BeyondFinalZero.QuadPart );
+        if (needs_close) close( fd );
         break;
     }
     default:
