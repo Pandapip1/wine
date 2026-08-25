@@ -25,3 +25,7 @@ jobs:
         if: always()
         shell: pwsh
         run: .github/probes/vhd-capability.ps1
+      - name: pipe WriteQuotaAvailable
+        if: always()
+        shell: pwsh
+        run: .github/probes/pipe-write-quota.ps1
