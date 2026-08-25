@@ -13,3 +13,7 @@ jobs:
       - name: FSCTL_SET_ZERO_DATA semantics
         shell: pwsh
         run: .github/probes/zero-data.ps1
+      - name: FSCTL_SET_ZERO_DATA edge cases
+        if: always()
+        shell: pwsh
+        run: .github/probes/zero-data-edges.ps1
