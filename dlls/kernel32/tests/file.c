@@ -4573,11 +4573,7 @@ static void test_CreateFile(void)
             ok(GetLastError() == ERROR_INVALID_PARAMETER, "%ld: expected ERROR_INVALID_PARAMETER, got %ld\n", i, GetLastError());
         }
         else
-        {
-            /* FIXME: remove once Wine is fixed */
-            todo_wine_if (i == 1)
             ok(GetLastError() == ERROR_ACCESS_DENIED, "%ld: expected ERROR_ACCESS_DENIED, got %ld\n", i, GetLastError());
-        }
 
         SetLastError(0xdeadbeef);
         hfile = CreateFileA(temp_path, GENERIC_WRITE, 0, NULL, i, 0, 0);
@@ -4585,11 +4581,7 @@ static void test_CreateFile(void)
         if (i == 0)
             ok(GetLastError() == ERROR_INVALID_PARAMETER, "%ld: expected ERROR_INVALID_PARAMETER, got %ld\n", i, GetLastError());
         else
-        {
-            /* FIXME: remove once Wine is fixed */
-            todo_wine_if (i == 1)
             ok(GetLastError() == ERROR_ACCESS_DENIED, "%ld: expected ERROR_ACCESS_DENIED, got %ld\n", i, GetLastError());
-        }
     }
 
     for (i = 0; i < ARRAY_SIZE(td); i++)
