@@ -173,6 +173,38 @@ public class P {
     LastMoved = done;
     return string.Format("read requested={0} read={1} last-NTSTATUS=0x{2:x8} iters={3}", total, done, laststatus, iters);
   }
+
+  // ------------------------------------------------------------------
+  // N discrete writes of S bytes each. Used by the message-overhead cells.
+  //
+  // Unlike Fill(), this does NOT coalesce: it issues EXACTLY one NtWriteFile
+  // per message, because on a message-type pipe one NtWriteFile == one message
+  // and the whole point of these cells is the message COUNT.
+  //
+  // ANTI-HANG: the loop runs at most N times (N is a small literal at every
+  // call site) and breaks out immediately on any non-zero NTSTATUS or any
+  // short write. Callers keep N*S far below the quota, and the handle is
+  // created non-blocking, so a write can never wait on a full buffer.
+  public static int LastCount = 0;
+  public static string WriteN(IntPtr h, int n, int s) {
+    IntPtr p = Buf(s > 0 ? s : 1);
+    for (int i = 0; i < s; i++) Marshal.WriteByte(p, i, (byte)(i & 0xff));
+    int ok = 0, bytes = 0, laststatus = 0, badIndex = -1, badStatus = 0, badMoved = -1;
+    for (int i = 0; i < n; i++) {
+      byte[] io = new byte[16];
+      laststatus = NtWriteFile(h, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, io,
+                               p, (uint)s, IntPtr.Zero, IntPtr.Zero);
+      int moved = (int)BitConverter.ToInt64(io, 8);
+      if (laststatus != 0) { badIndex = i; badStatus = laststatus; badMoved = moved; break; }
+      bytes += moved;
+      if (moved != s) { badIndex = i; badStatus = laststatus; badMoved = moved; break; }
+      ok++;
+    }
+    LastMoved = bytes; LastCount = ok;
+    return string.Format(
+      "writes: requested N={0} of S={1} (N*S={2})  completed-writes={3}  bytes-written={4}  first-bad-write-index={5} (its NTSTATUS=0x{6:x8}, bytes-moved={7})  last-NTSTATUS=0x{8:x8}",
+      n, s, (long)n * s, ok, bytes, badIndex, badStatus, badMoved, laststatus);
+  }
 }
 "@
 Add-Type -TypeDefinition $cs
@@ -370,5 +402,162 @@ Cell -Tag "mode-msg-nonblocking"  -ReqQuota 65536 -FillState "half" -PipeType 1 
      -Note "message type, message read mode, non-blocking. Only the type/read-mode differs from mode-byte-nonblocking."
 Cell -Tag "mode-msg-blocking"     -ReqQuota 65536 -FillState "half" -PipeType 1 -ReadMode 1 -CompMode 0 `
      -Note "message type, message read mode, blocking."
+
+# ===========================================================================
+# AXIS 4: does WriteQuotaAvailable subtract DATA BYTES, or BUFFER SPACE
+#         CONSUMED (which on a message pipe may include per-message
+#         bookkeeping charged against the quota)?
+#
+# Run 32877718116 established that WriteQuotaAvailable is live: an end's value
+# is its write-direction quota minus what is buffered in that direction. Every
+# cell in that run wrote byte-stream data with no per-message framing, so it
+# could not separate:
+#
+#   (H1) NT subtracts exactly the number of DATA BYTES buffered.
+#   (H2) NT subtracts the buffer space CONSUMED, message bookkeeping included.
+#
+# The existing mode-msg-* cells wrote ONE 32768-byte message and reported
+# 32768. One message carries one message's worth of overhead, which could be
+# zero, rounded away, or simply not charged - so those cells do not separate
+# H1 from H2 either.
+#
+# DISCRIMINATOR: MANY SMALL MESSAGES vs THE SAME TOTAL IN BYTE MODE.
+# Every cell below writes N*S = 16384 bytes at the same requested quota
+# (65536, the default, so these are comparable with the AXIS 1-3 cells), but
+# splits that total across a different number of writes. Each message-mode
+# shape is paired with a BYTE-MODE CONTROL that writes the identical total in
+# the identical chunk sizes. The byte-mode control is what makes the
+# message-mode number interpretable: any per-message charge is the DIFFERENCE
+# between the pair, so neither number has to be read on its own, and any
+# effect of merely issuing many small writes (as opposed to many MESSAGES)
+# shows up in the byte-mode member of the pair.
+#
+# N is varied at a constant total so a PER-MESSAGE cost separates from a
+# FIXED cost: if the deficit tracks N and not N*S, it is per-message.
+#
+# NO VERDICT IS COMPUTED HERE. Each cell prints the raw ten fields for both
+# ends, the requested and the effective quota, N, S, N*S, the raw NTSTATUS
+# values, the arithmetic value (effective-quota - N*S) next to the observed
+# WriteQuotaAvailable, their difference, and that difference divided by N.
+# Which hypothesis those numbers support is the reader's call.
+#
+# ANTI-HANG: every cell writes 16384 bytes into a >= 65536-byte quota, the
+# server handle is non-blocking (FILE_PIPE_COMPLETE_OPERATION), every write
+# loop is bounded by the literal N, and the loop breaks on the first non-zero
+# NTSTATUS or short write. Nothing is ever read back, so no read can wait on
+# an empty buffer either.
+#
+# PER-CELL POSITIVE CONTROL: if message-mode writes silently failed, the
+# deficit would be zero and would read as H1. So each cell asserts that the
+# CLIENT end's ReadDataAvailable equals the N*S it believes it wrote, and
+# prints both numbers whether or not they agree. A cell whose control line
+# says MISMATCH carries no information about the quota arithmetic.
+# ===========================================================================
+Write-Output "########## AXIS 4: message-count vs byte-total, at the default quota ##########"
+Write-Output ""
+
+function MsgCell {
+  param(
+    [string]$Tag,
+    [uint32]$ReqQuota,
+    [int]$N,
+    [int]$S,
+    [uint32]$PipeType,      # 0 = FILE_PIPE_BYTE_STREAM_TYPE, 1 = FILE_PIPE_MESSAGE_TYPE
+    [uint32]$ReadMode,      # 0 = FILE_PIPE_BYTE_STREAM_MODE, 1 = FILE_PIPE_MESSAGE_MODE
+    [string]$Note = ""
+  )
+  # Write-Host, not Write-Output: output written inside a function is captured
+  # by an assignment at the call site instead of being printed. That bug has
+  # already been caught twice in these scripts and the AST parser does not see
+  # it, so this function never uses Write-Output.
+  $total = $N * $S
+  $typeStr = $(if ($PipeType -eq 1) { "MESSAGE" } else { "BYTE-STREAM" })
+  Write-Host "=== [$Tag] requested-quota=$ReqQuota N=$N S=$S N*S=$total type=$PipeType($typeStr) readmode=$ReadMode compmode=1(non-blocking)"
+  if ($Note) { Write-Host "    NOTE: $Note" }
+
+  $nm = NewNames
+  $sh = [IntPtr]::Zero
+  $st = [P]::CreateServer($nm.Nt, $ReqQuota, $ReqQuota, $PipeType, $ReadMode, 1, [ref]$sh)
+  Write-Host ("    NtCreateNamedPipeFile(InboundQuota={0}, OutboundQuota={1}) NTSTATUS=0x{2:x8}" -f $ReqQuota, $ReqQuota, $st)
+  if ($st -ne 0) {
+    Write-Host "    pipe not created; that NTSTATUS is the result for this cell."
+    Write-Host ""
+    return
+  }
+
+  Write-Host ("    server fresh          {0}" -f [P]::Local($sh))
+  $effIn  = [P]::Field($sh, 4)   # InboundQuota  as reported by NT
+  $effOut = [P]::Field($sh, 6)   # OutboundQuota as reported by NT
+  Write-Host ("    effective quotas as reported by NT: InboundQuota={0} OutboundQuota={1} (both requested as {2})" -f $effIn, $effOut, $ReqQuota)
+  if ($effOut -ne [long]$ReqQuota) {
+    Write-Host "    WARNING: NT did not report back the requested outbound quota. This cell is NOT directly comparable with cells whose effective quota differs."
+  }
+  if ($effOut -gt 0 -and $total -ge $effOut) {
+    Write-Host "    REFUSING TO WRITE: N*S is not below the effective outbound quota; writing could fill the pipe. Cell skipped."
+    [void][P]::CloseHandle($sh); Write-Host ""; return
+  }
+
+  $ch = [P]::OpenClient($nm.Dos)
+  if ($ch -eq [P]::INVALID) {
+    Write-Host ("    CreateFileW({0}) FAILED err={1}" -f $nm.Dos, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+    [void][P]::CloseHandle($sh); Write-Host ""; return
+  }
+  Write-Host ("    client connected: {0}" -f $nm.Dos)
+
+  Write-Host ("    {0}" -f [P]::WriteN($sh, $N, $S))
+  $wrote  = [P]::LastMoved
+  $nDone  = [P]::LastCount
+
+  Write-Host ("    SERVER (writing end)  {0}" -f [P]::Local($sh))
+  Write-Host ("    SERVER  std           {0}" -f [P]::Std($sh))
+  Write-Host ("    CLIENT (reading end)  {0}" -f [P]::Local($ch))
+  Write-Host ("    CLIENT  std           {0}" -f [P]::Std($ch))
+
+  # Per-cell positive control: the bytes must actually be in the buffer.
+  $rda = [P]::Field($ch, 5)      # ReadDataAvailable on the client (reading) end
+  $ctl = $(if ($wrote -eq $total -and $nDone -eq $N -and $rda -eq [long]$total) { "OK" } else { "MISMATCH" })
+  Write-Host ("    CONTROL [{0}]: intended N*S={1}  bytes-actually-written={2}  writes-completed={3}/{4}  client ReadDataAvailable={5}" -f $ctl, $total, $wrote, $nDone, $N, $rda)
+  if ($ctl -ne "OK") {
+    Write-Host "    CONTROL MISMATCH: the writes did not all land as intended. The quota arithmetic printed below says nothing about message overhead for this cell."
+  }
+
+  # Arithmetic, printed so a reader does not have to compute it. Not a verdict.
+  $wqa = [P]::Field($sh, 7)      # WriteQuotaAvailable on the server (writing) end
+  $expected = [long]$effOut - [long]$total
+  $diff = $expected - $wqa
+  Write-Host ("    ARITHMETIC: effective-OutboundQuota({0}) - N*S({1}) = {2}   observed server WriteQuotaAvailable = {3}   difference = {4}" -f $effOut, $total, $expected, $wqa, $diff)
+  if ($N -gt 0) {
+    Write-Host ("    ARITHMETIC: difference / N = {0} / {1} = {2}" -f $diff, $N, ([double]$diff / [double]$N))
+  }
+  Write-Host ("    ARITHMETIC: bytes-actually-written = {0}; effective-OutboundQuota - bytes-actually-written = {1}" -f $wrote, ([long]$effOut - [long]$wrote))
+
+  [void][P]::CloseHandle($ch)
+  [void][P]::CloseHandle($sh)
+  Write-Host ""
+}
+
+# --- Pair 1: 256 writes of 64 bytes. The headline discriminator. ------------
+MsgCell -Tag "ovh-msg-N256-S64"  -ReqQuota 65536 -N 256 -S 64  -PipeType 1 -ReadMode 1 `
+        -Note "MESSAGE type/read mode, 256 messages of 64 bytes. Compare with ovh-byte-N256-S64, which differs ONLY in the pipe type and read mode."
+MsgCell -Tag "ovh-byte-N256-S64" -ReqQuota 65536 -N 256 -S 64  -PipeType 0 -ReadMode 0 `
+        -Note "BYTE-STREAM CONTROL for ovh-msg-N256-S64: identical total in identical chunk sizes, 256 writes of 64 bytes, no message framing. Any charge that appears here is a cost of issuing many small WRITES, not of many MESSAGES."
+
+# --- Pair 2: same total, FEWER messages (64 x 256). -------------------------
+MsgCell -Tag "ovh-msg-N64-S256"  -ReqQuota 65536 -N 64  -S 256 -PipeType 1 -ReadMode 1 `
+        -Note "MESSAGE mode, same 16384-byte total as pair 1 but a quarter as many messages. Only N and S change from ovh-msg-N256-S64."
+MsgCell -Tag "ovh-byte-N64-S256" -ReqQuota 65536 -N 64  -S 256 -PipeType 0 -ReadMode 0 `
+        -Note "BYTE-STREAM CONTROL for ovh-msg-N64-S256."
+
+# --- Pair 3: same total, MORE messages (512 x 32). --------------------------
+MsgCell -Tag "ovh-msg-N512-S32"  -ReqQuota 65536 -N 512 -S 32  -PipeType 1 -ReadMode 1 `
+        -Note "MESSAGE mode, same 16384-byte total as pairs 1 and 2 but twice as many messages as pair 1. If the difference tracks N rather than N*S, these three message cells show it directly."
+MsgCell -Tag "ovh-byte-N512-S32" -ReqQuota 65536 -N 512 -S 32  -PipeType 0 -ReadMode 0 `
+        -Note "BYTE-STREAM CONTROL for ovh-msg-N512-S32."
+
+# --- Pair 4: same total in ONE message. The N=1 end of the N sweep. ---------
+MsgCell -Tag "ovh-msg-N1-S16384"  -ReqQuota 65536 -N 1 -S 16384 -PipeType 1 -ReadMode 1 `
+        -Note "MESSAGE mode, the same 16384-byte total as a SINGLE message. This is the N=1 point of the same sweep: with one message there is at most one message's overhead, so a fixed cost survives here and a per-message cost nearly vanishes."
+MsgCell -Tag "ovh-byte-N1-S16384" -ReqQuota 65536 -N 1 -S 16384 -PipeType 0 -ReadMode 0 `
+        -Note "BYTE-STREAM CONTROL for ovh-msg-N1-S16384."
 
 Write-Output "########## end of probe ##########"
