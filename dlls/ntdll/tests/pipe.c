@@ -2433,6 +2433,104 @@ static void test_pipe_local_info(HANDLE pipe, BOOL is_server, DWORD state)
             is_server ? "server" : "client", state, status);
 }
 
+#define WQ_QUOTA 4096
+
+static void check_write_quota(HANDLE server, HANDLE client, ULONG expect_server_wq,
+                              ULONG expect_client_rda, const char *stage)
+{
+    FILE_PIPE_LOCAL_INFORMATION info;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS status;
+
+    memset(&iosb, 0xcc, sizeof(iosb));
+    memset(&info, 0xcc, sizeof(info));
+    status = pNtQueryInformationFile(server, &iosb, &info, sizeof(info), FilePipeLocalInformation);
+    ok(status == STATUS_SUCCESS, "%s: server NtQueryInformationFile failed: %lx\n", stage, status);
+    ok(info.OutboundQuota == WQ_QUOTA, "%s: server OutboundQuota = %lu\n", stage, info.OutboundQuota);
+    ok(info.WriteQuotaAvailable == expect_server_wq, "%s: server WriteQuotaAvailable = %lu, expected %lu\n",
+       stage, info.WriteQuotaAvailable, expect_server_wq);
+    ok(info.ReadDataAvailable == 0, "%s: server ReadDataAvailable = %lu\n", stage, info.ReadDataAvailable);
+
+    memset(&iosb, 0xcc, sizeof(iosb));
+    memset(&info, 0xcc, sizeof(info));
+    status = pNtQueryInformationFile(client, &iosb, &info, sizeof(info), FilePipeLocalInformation);
+    ok(status == STATUS_SUCCESS, "%s: client NtQueryInformationFile failed: %lx\n", stage, status);
+    ok(info.ReadDataAvailable == expect_client_rda, "%s: client ReadDataAvailable = %lu, expected %lu\n",
+       stage, info.ReadDataAvailable, expect_client_rda);
+    /* Nothing is ever written in the client->server direction in this test, so the
+     * client's own write quota stays full throughout - as it did in every cell of the
+     * measurement run. That is a fact about this stimulus, not about the client end. */
+    ok(info.WriteQuotaAvailable == WQ_QUOTA, "%s: client WriteQuotaAvailable = %lu\n",
+       stage, info.WriteQuotaAvailable);
+}
+
+/* An end's WriteQuotaAvailable is its write-direction quota minus the bytes currently
+ * buffered in that direction, i.e. the data the other end can read; draining restores it.
+ * Measured on Windows Server 2025 build 26100, GitHub Actions run 32877718116 at commit
+ * 1436a39f9, probe .github/probes/pipe-write-quota.ps1. All data here is written on the
+ * server handle, so it lands in the outbound buffer and is read by the client, exactly as
+ * in that run. The server handle is put in PIPE_NOWAIT before filling so that a full pipe
+ * can never block this test. */
+static void test_pipe_write_quota(void)
+{
+    char buffer[WQ_QUOTA];
+    DWORD mode, moved;
+    HANDLE server, client;
+    BOOL ret;
+
+    server = CreateNamedPipeA(PIPENAME, PIPE_ACCESS_DUPLEX,
+                              PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                              1, WQ_QUOTA, WQ_QUOTA, NMPWAIT_USE_DEFAULT_WAIT, NULL);
+    ok(server != INVALID_HANDLE_VALUE, "CreateNamedPipe failed: %lu\n", GetLastError());
+    if (server == INVALID_HANDLE_VALUE) return;
+
+    client = CreateFileA(PIPENAME, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    ok(client != INVALID_HANDLE_VALUE, "CreateFile failed: %lu\n", GetLastError());
+    if (client == INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(server);
+        return;
+    }
+
+    memset(buffer, 'x', sizeof(buffer));
+
+    /* fresh: nothing buffered, the whole quota is available */
+    check_write_quota(server, client, WQ_QUOTA, 0, "fresh");
+
+    mode = PIPE_NOWAIT;
+    ret = SetNamedPipeHandleState(server, &mode, NULL, NULL);
+    ok(ret, "SetNamedPipeHandleState failed: %lu\n", GetLastError());
+
+    /* partially filled: reduced by exactly the bytes buffered */
+    moved = 0;
+    ret = WriteFile(server, buffer, 1000, &moved, NULL);
+    ok(ret && moved == 1000, "WriteFile returned %d, wrote %lu\n", ret, moved);
+    check_write_quota(server, client, WQ_QUOTA - 1000, 1000, "partial");
+
+    /* full: the rest of the quota takes it to zero */
+    moved = 0;
+    ret = WriteFile(server, buffer, WQ_QUOTA - 1000, &moved, NULL);
+    ok(ret && moved == WQ_QUOTA - 1000, "WriteFile returned %d, wrote %lu\n", ret, moved);
+    check_write_quota(server, client, 0, WQ_QUOTA, "full");
+
+    /* half drained: the freed bytes come straight back */
+    moved = 0;
+    ret = ReadFile(client, buffer, WQ_QUOTA / 2, &moved, NULL);
+    ok(ret && moved == WQ_QUOTA / 2, "ReadFile returned %d, read %lu\n", ret, moved);
+    check_write_quota(server, client, WQ_QUOTA / 2, WQ_QUOTA / 2, "half-drained");
+
+    /* fully drained: back to the whole quota */
+    moved = 0;
+    ret = ReadFile(client, buffer, WQ_QUOTA / 2, &moved, NULL);
+    ok(ret && moved == WQ_QUOTA / 2, "ReadFile returned %d, read %lu\n", ret, moved);
+    check_write_quota(server, client, WQ_QUOTA, 0, "drained");
+
+    CloseHandle(client);
+    CloseHandle(server);
+}
+
+#undef WQ_QUOTA
+
 static void test_file_info(void)
 {
     HANDLE server, client, device;
@@ -3210,6 +3308,7 @@ START_TEST(pipe)
     read_pipe_test(PIPE_ACCESS_OUTBOUND, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE);
 
     test_transceive();
+    test_pipe_write_quota();
     test_volume_info();
     test_file_info();
     test_security_info();

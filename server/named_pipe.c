@@ -807,9 +807,21 @@ static void pipe_end_get_file_info( struct fd *fd, obj_handle_t handle, unsigned
             pipe_info->NamedPipeEnd        = pipe_end->obj.ops == &pipe_server_ops
                 ? FILE_PIPE_SERVER_END : FILE_PIPE_CLIENT_END;
 
+            /* Measured on real NT (Windows Server 2025 build 26100, GitHub Actions run
+             * 32877718116 at commit 1436a39f9, probe .github/probes/pipe-write-quota.ps1):
+             * an end's WriteQuotaAvailable is its write-direction quota minus the bytes
+             * currently buffered in that direction, i.e. the data the other end can read.
+             * It tracks live in both directions and draining restores it exactly.
+             * When the other end is gone the probe's rd-closed cell measured the full
+             * quota (32768 bytes still written, server reported WriteQuotaAvailable equal
+             * to the whole 65536 OutboundQuota), so leave it unreduced in that case. */
             pipe_info->WriteQuotaAvailable = pipe_info->NamedPipeEnd == FILE_PIPE_CLIENT_END
                 ? pipe_info->InboundQuota : pipe_info->OutboundQuota;
-                /* FIXME: Needs to be reduced by ReadDataAvailable at the other end of the pipe. */
+            if (pipe_end->connection)
+            {
+                data_size_t buffered = pipe_end_get_avail( pipe_end->connection );
+                pipe_info->WriteQuotaAvailable -= min( buffered, pipe_info->WriteQuotaAvailable );
+            }
             break;
         }
     case FileStandardInformation:
