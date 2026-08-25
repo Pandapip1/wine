@@ -21,11 +21,11 @@ jobs:
         if: always()
         shell: pwsh
         run: .github/probes/zero-data-buflen.ps1
-      - name: VHD / cluster-size capability
-        if: always()
-        shell: pwsh
-        run: .github/probes/vhd-capability.ps1
       - name: pipe WriteQuotaAvailable
         if: always()
         shell: pwsh
         run: .github/probes/pipe-write-quota.ps1
+      - name: SET_ZERO_DATA granularity vs cluster size
+        if: always()
+        shell: pwsh
+        run: .github/probes/zero-data-cluster.ps1
