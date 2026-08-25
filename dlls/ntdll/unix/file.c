@@ -632,13 +632,49 @@ static NTSTATUS write_file_zeros( int fd, off_t pos, off_t end )
 
 
 /* The unit of storage NTFS gives up when a range of a sparse file is zeroed.
- * Measured on Windows Server 2025 (NTFS, 4 KB clusters): a hole appears only
- * where a whole 64 KB-aligned unit lies inside the range.  Zeroing one 4 KB
- * cluster, or 60 KB ending on a 64 KB boundary, or a full 64 KB straddling two
- * units, all left the allocation size untouched; zeroing [65536,131072) gave
- * back exactly 64 KB.  So it is the alignment of the unit that matters, not the
- * length of the range and not the cluster size. */
-#define ZERO_DATA_GRANULARITY  0x10000
+ * A hole appears only where a whole aligned unit of this size lies inside the
+ * range, so it is the alignment of the unit that matters and not the length of
+ * the range.
+ *
+ * The unit is min( 16 * cluster_size, 65536 ) -- the NTFS compression unit,
+ * sixteen clusters capped at 64 KB.  Measured on Windows Server 2025 (build
+ * 26100) by .github/probes/zero-data-cluster.ps1 in GitHub Actions run
+ * 32878521315, on NTFS volumes built on VHDs whose cluster size was read back
+ * and verified before measuring:
+ *
+ *     cluster 4096 -> 65536      cluster 8192 -> 65536 (capped)
+ *     cluster 1024 -> 16384
+ *
+ * An earlier reading of this as a CONSTANT 64 KB was wrong, and wrong for a
+ * reason worth recording: it came from measuring only 4096-cluster volumes,
+ * where 16 * 4096 == 65536 makes the two rules indistinguishable.
+ *
+ * On Unix the closest thing to the cluster size that the fstat() already done
+ * here provides is st_blksize.  That is the PREFERRED I/O BLOCK SIZE, which is
+ * not by definition the allocation unit -- man 2 stat warns that the
+ * interpretation of st_blksize differs between systems and with NFS mounts.
+ * It is used anyway because the error is bounded in both directions and never
+ * reaches the data: a value too large is clamped by the 64 KB cap, and a value
+ * too small only punches a smaller aligned window, since FALLOC_FL_PUNCH_HOLE
+ * over a sub-block range zeroes the partial blocks instead of failing.  Either
+ * way the zeroed bytes still read back as zeroes; only the space saving moves. */
+#define ZERO_DATA_GRANULARITY_MAX  0x10000
+#define ZERO_DATA_BLOCK_DEFAULT    0x1000
+
+#if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
+static off_t zero_data_granularity( const struct stat *st )
+{
+    off_t block = st->st_blksize;
+
+    /* the masks below need a power of two, and a filesystem reporting nonsense
+     * must not produce a zero or absurd granularity: fall back to 4 KB, which
+     * is both the NTFS default cluster size and the allocation unit this fork
+     * reports from FileFsSizeInformation */
+    if (block <= 0 || (block & (block - 1))) block = ZERO_DATA_BLOCK_DEFAULT;
+    if (block > ZERO_DATA_GRANULARITY_MAX / 16) return ZERO_DATA_GRANULARITY_MAX;
+    return block * 16;
+}
+#endif
 
 /* Implement FSCTL_SET_ZERO_DATA over [offset,end).
  *
@@ -667,8 +703,9 @@ static NTSTATUS set_zero_data( int fd, LONGLONG offset, LONGLONG beyond_final_ze
     if (is_sparse_file( fd ))
     {
 #if defined(__linux__) && defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
-        off_t lo = (pos + ZERO_DATA_GRANULARITY - 1) & ~(off_t)(ZERO_DATA_GRANULARITY - 1);
-        off_t hi = end & ~(off_t)(ZERO_DATA_GRANULARITY - 1);
+        off_t granularity = zero_data_granularity( &st );
+        off_t lo = (pos + granularity - 1) & ~(granularity - 1);
+        off_t hi = end & ~(granularity - 1);
 
         if (lo < hi)
         {

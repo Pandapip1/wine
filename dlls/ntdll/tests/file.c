@@ -1826,12 +1826,21 @@ static void test_file_sparse_allocation(void)
     CloseHandle( h );
 }
 
-/* FSCTL_SET_ZERO_DATA.  The rules checked here were measured on Windows Server
- * 2025 (NTFS, 4 KB clusters); the granularity at which storage is released is
- * 64 KB, not the cluster size, and only whole 64 KB-aligned units lying inside
- * the range are given up. */
-#define ZERO_DATA_SIZE   0x100000
-#define ZERO_DATA_UNIT   0x10000
+/* FSCTL_SET_ZERO_DATA.  Storage is released only for whole aligned units lying
+ * inside the range; the unit is min( 16 * cluster_size, 65536 ), measured on
+ * Windows Server 2025 (build 26100) by .github/probes/zero-data-cluster.ps1 in
+ * GitHub Actions run 32878521315 across verified 1024, 4096 and 8192-byte
+ * cluster volumes.  It is NOT a constant 64 KB -- that reading came from
+ * measuring only 4096-cluster volumes, where 16 * 4096 == 65536 makes the two
+ * rules indistinguishable.
+ *
+ * So nothing here may hardcode 64 KB as THE granularity: a test that passes only
+ * because the host happens to use 4096-byte blocks tests the host, not the code.
+ * The granularity-sensitive cases below measure the unit first (see
+ * zero_data_measure_unit) and phrase themselves relative to it.  64 KB survives
+ * only as the largest unit the rule can produce. */
+#define ZERO_DATA_SIZE       0x100000
+#define ZERO_DATA_UNIT_MAX   0x10000
 
 static BOOL zero_data_fill( HANDLE h, char *pattern )
 {
@@ -1882,14 +1891,57 @@ static void zero_data_check_contents( HANDLE h, LONGLONG offset, LONGLONG beyond
     free( buffer );
 }
 
+/* Measure the granularity at which storage is actually released, instead of
+ * assuming it.  This is the ladder the CI probe used: for a candidate size Gc,
+ * zeroing the aligned range [Gc,2*Gc) of a fresh sparse file cannot contain a
+ * whole unit if Gc < G and is exactly one whole unit if Gc >= G (every
+ * plausible G, and every candidate here, is a power of two).  So the smallest
+ * candidate that releases anything IS the granularity.
+ *
+ * Returns 0 if nothing is released at any size -- either the filesystem cannot
+ * punch holes at all, or the granularity is above 64 KB, which the measured
+ * rule says cannot happen.
+ *
+ * The ladder starts at 512 rather than 4096 so that a granularity below 64 KB
+ * is read off exactly: starting above the true G would report the first
+ * candidate that happens to be a multiple of it. */
+static ULONGLONG zero_data_measure_unit( char *pattern )
+{
+    ULONGLONG unit, eof, alloc, eof2, alloc2;
+    HANDLE h;
+
+    for (unit = 512; unit <= ZERO_DATA_UNIT_MAX; unit *= 2)
+    {
+        if (!(h = create_temp_file(0))) return 0;
+        mark_sparse( h, __LINE__ );
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ )
+            && zero_data( h, unit, unit * 2 ) == STATUS_SUCCESS
+            && sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+        {
+            if (alloc2 < alloc)
+            {
+                CloseHandle( h );
+                trace( "storage is released at a granularity of %I64u bytes\n", unit );
+                return unit;
+            }
+        }
+        CloseHandle( h );
+    }
+    return 0;
+}
+
 static void test_file_set_zero_data(void)
 {
-    ULONGLONG eof, alloc, eof2, alloc2;
+    ULONGLONG eof, alloc, eof2, alloc2, unit;
     char *pattern;
     NTSTATUS res;
     HANDLE h;
 
     if (!(pattern = malloc( ZERO_DATA_SIZE ))) return;
+
+    unit = zero_data_measure_unit( pattern );
+    ok( !unit || (unit <= ZERO_DATA_UNIT_MAX && !(unit & (unit - 1))),
+        "the measured granularity %I64u is not a power of two at or below 64 KB\n", unit );
 
     /* a file that has not been marked sparse: the bytes are zeroed where they
      * are and no storage is released */
@@ -1910,9 +1962,10 @@ static void test_file_set_zero_data(void)
         CloseHandle( h );
     }
 
-    /* the same range on a file that has been marked sparse: the two whole 64 KB
-     * units inside [0x40000,0xc0000) are given back, which is the whole range
-     * here since both ends are already aligned */
+    /* the same range on a file that has been marked sparse: the whole range is
+     * given back.  Both bounds are multiples of 64 KB, so they are aligned to
+     * every granularity the rule can produce and the expected figure does not
+     * depend on which one this host uses. */
     if ((h = create_temp_file(0)))
     {
         mark_sparse( h, __LINE__ );
@@ -1939,26 +1992,33 @@ static void test_file_set_zero_data(void)
         CloseHandle( h );
     }
 
-    /* a range that does not cover a whole 64 KB unit releases nothing, but the
-     * bytes still read back as zeroes */
-    if ((h = create_temp_file(0)))
+    /* a range that contains no whole aligned unit releases nothing, but the bytes
+     * still read back as zeroes.  The range is one unit long and offset by half
+     * a unit, so it straddles two units and covers neither of them whole -- that
+     * is true for whatever granularity this host has, which a hardcoded
+     * [0x1000,0x2000) would not be: on a host with a 4 KB granularity that range
+     * is a whole aligned unit and does release storage. */
+    if (unit && (h = create_temp_file(0)))
     {
+        LONGLONG lo = unit / 2, hi = lo + unit;
+
         mark_sparse( h, __LINE__ );
         if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
         {
-            res = zero_data( h, 0x1000, 0x2000 );
+            res = zero_data( h, lo, hi );
             ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
-            zero_data_check_contents( h, 0x1000, 0x2000, __LINE__ );
+            zero_data_check_contents( h, lo, hi, __LINE__ );
             if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
             {
                 ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
                 ok( alloc2 == alloc,
-                    "a range covering no whole 64 KB unit: expected allocation %I64u, got %I64u\n",
-                    alloc, alloc2 );
+                    "[%I64d,%I64d) covers no whole %I64u-byte unit: expected allocation %I64u, got %I64u\n",
+                    lo, hi, unit, alloc, alloc2 );
             }
         }
         CloseHandle( h );
     }
+    else if (!unit) skip( "storage is never released on this filesystem\n" );
 
     /* the range never extends the file: past the end, straddling it and starting
      * exactly at it all succeed and change neither size */
@@ -1968,7 +2028,7 @@ static void test_file_set_zero_data(void)
         {
             res = zero_data( h, ZERO_DATA_SIZE * 2, ZERO_DATA_SIZE * 3 );
             ok( res == STATUS_SUCCESS, "a range past the end of file returned %lx\n", res );
-            res = zero_data( h, ZERO_DATA_SIZE, ZERO_DATA_SIZE + ZERO_DATA_UNIT );
+            res = zero_data( h, ZERO_DATA_SIZE, ZERO_DATA_SIZE + ZERO_DATA_UNIT_MAX );
             ok( res == STATUS_SUCCESS, "a range starting at the end of file returned %lx\n", res );
             if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
             {
@@ -1977,9 +2037,9 @@ static void test_file_set_zero_data(void)
             }
             /* straddling the end of file: the part inside the file is zeroed and
              * the file does not grow */
-            res = zero_data( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT, ZERO_DATA_SIZE * 2 );
+            res = zero_data( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT_MAX, ZERO_DATA_SIZE * 2 );
             ok( res == STATUS_SUCCESS, "a range straddling the end of file returned %lx\n", res );
-            zero_data_check_contents( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT, ZERO_DATA_SIZE, __LINE__ );
+            zero_data_check_contents( h, ZERO_DATA_SIZE - ZERO_DATA_UNIT_MAX, ZERO_DATA_SIZE, __LINE__ );
             if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
                 ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
         }
