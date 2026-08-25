@@ -17,3 +17,7 @@ jobs:
         if: always()
         shell: pwsh
         run: .github/probes/zero-data-edges.ps1
+      - name: FSCTL_SET_ZERO_DATA input buffer length
+        if: always()
+        shell: pwsh
+        run: .github/probes/zero-data-buflen.ps1
