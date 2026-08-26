@@ -82,6 +82,7 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(server);
 WINE_DECLARE_DEBUG_CHANNEL(syscall);
+WINE_DECLARE_DEBUG_CHANNEL(process);
 
 #ifndef MSG_CMSG_CLOEXEC
 #define MSG_CMSG_CLOEXEC 0
@@ -1860,6 +1861,12 @@ NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_hand
         *process_handle = wine_server_ptr_handle( process_obj );
         *thread_handle  = wine_server_ptr_handle( thread_obj );
         *client_id = make_client_id( new_pid, new_tid );
+        /* on the "process" channel, not "server": clone_process is otherwise
+         * visible only under +server, and +server perturbs the timing of the
+         * clone/context handshake enough to change which bugs reproduce. This
+         * lets fork emulation be observed without that. */
+        TRACE_(process)( "cloned pid %04x tid %04x, process handle %p thread handle %p\n",
+                         new_pid, new_tid, *process_handle, *thread_handle );
         return STATUS_SUCCESS;
     }
 

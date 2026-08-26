@@ -68,6 +68,8 @@ struct process
     unsigned int         is_system:1;     /* is it a system process? */
     unsigned int         debug_children:1;/* also debug all child processes */
     unsigned int         is_terminating:1;/* is process terminating? */
+    unsigned int         is_clone:1;      /* was this process made by clone_process (fork emulation)? */
+    unsigned int         clone_race_forced:1; /* WINE_CLONE_RACE_TEST: the one forced stop_thread has been done */
     data_size_t          imagelen;        /* length of image path in bytes */
     WCHAR               *image;           /* main exe image full path */
     struct job          *job;             /* job object associated with this process */

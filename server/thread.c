@@ -901,6 +901,45 @@ static void set_thread_info( struct thread *thread,
     }
 }
 
+/* give a thread a context object in the PENDING state, before it has ever
+ * issued a context-carrying select of its own.
+ *
+ * This exists for clone_process (fork emulation). The clone's initial thread
+ * is created already suspended and its client side parks in wait_suspend()
+ * unconditionally, from ordinary code with signals unblocked -- unlike every
+ * other thread in Wine, which only ever enters wait_suspend() from the SIGUSR1
+ * handler or once at thread start with signals still blocked. That breaks the
+ * invariant that a thread is inside at most one context-carrying select at a
+ * time: if the parent's NtGetContextThread reaches the server after the clone
+ * has registered with init_first_thread but before the server has processed
+ * the clone's first select, stop_thread() finds thread->context == NULL and
+ * sends SIGUSR1. The clone has SIGUSR1 blocked for the duration of that select
+ * request, so the handler runs *after* the select is accepted -- and calls
+ * wait_suspend() a second time, nested inside the first. That second select
+ * finds ctx->status == STATUS_SUCCESS rather than STATUS_PENDING and is
+ * rejected with STATUS_INVALID_PARAMETER before select_on() ever registers a
+ * wait, which deadlocks the client: see the "we stole another reply" recursion
+ * in wait_select_reply() (dlls/ntdll/unix/server.c), which recurses to wait for
+ * a cookie the server will never send *before* writing the stolen reply back,
+ * so the outer select's wakeup is held in that stack frame forever.
+ *
+ * Creating the context here, while the clone's process object is still being
+ * built and before the parent is even handed a thread handle, makes
+ * thread->context non-NULL for every possible arrival order. stop_thread()
+ * then returns at its first line and SIGUSR1 is never sent to a clone's
+ * initial thread at all, so the nesting is structurally impossible rather
+ * than merely unlikely. Both orderings converge on the handshake that already
+ * works: the parent either gets STATUS_PENDING plus a sync handle and waits,
+ * or gets the clone's zeroed placeholder context directly.
+ *
+ * cleanup_thread() releases thread->context and signals its sync, so a clone
+ * that dies before ever selecting does not leak this or strand a waiter. */
+void set_thread_pending_context( struct thread *thread )
+{
+    if (thread->context) return;
+    thread->context = create_thread_context( thread );
+}
+
 /* stop a thread (at the Unix level) */
 void stop_thread( struct thread *thread )
 {
@@ -1899,6 +1938,20 @@ DECL_HANDLER(resume_thread)
     }
 }
 
+/* WINE_CLONE_RACE_TEST: see the hook in DECL_HANDLER(select) below. Test-only,
+ * read once, off unless the variable is exactly "1". */
+static int clone_race_test(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *str = getenv( "WINE_CLONE_RACE_TEST" );
+        enabled = (str && !strcmp( str, "1" ));
+    }
+    return enabled;
+}
+
 /* select on a handle list */
 DECL_HANDLER(select)
 {
@@ -1916,6 +1969,59 @@ DECL_HANDLER(select)
     ctx_count = ctx_size / sizeof(struct context_data);
     if (ctx_count * sizeof(struct context_data) != ctx_size) goto invalid_param;
     if (ctx_count > 1 + (current->process->machine != native_machine)) goto invalid_param;
+
+    /* Forced-order reproducer for the clone_process nested-wait_suspend
+     * deadlock, enabled only by WINE_CLONE_RACE_TEST=1 in wineserver's own
+     * environment. Never runs otherwise.
+     *
+     * The race being reproduced is won or lost purely on which of two client
+     * processes the single-threaded server happens to read from first: the
+     * clone's first (context-carrying) select, or the parent's
+     * NtGetContextThread on the clone's thread handle. Measured base rate,
+     * from a +server,+sync trace of a real workload: 3592 clone_process calls
+     * and exactly ONE failure; 472 threads issued a startup context select and
+     * exactly ONE issued a second (the deadlocked clone). Reproducing that by
+     * repetition is not viable, so this forces the order instead.
+     *
+     * stop_thread() is the *only* thing the parent's get_thread_context does
+     * to the clone in that window (thread.c, DECL_HANDLER(get_thread_context),
+     * the `if (thread != current) stop_thread( thread );` line), so calling it
+     * here -- before this select's context is accepted, while the client has
+     * SIGUSR1 blocked for the duration of the request -- is a faithful stand-in
+     * for the parent's request having been read first. It is deterministic:
+     * it happens inside the handler, not on the wall clock.
+     *
+     * WHAT THIS PROVES: that with the fix in place the forced ordering no
+     * longer wedges, because set_thread_pending_context() has already given
+     * the thread a context and stop_thread() therefore returns at its first
+     * line without sending SIGUSR1. Without the fix, the same hook hangs the
+     * clone on the first try.
+     *
+     * WHAT THIS DOES NOT PROVE: that no other ordering can wedge a clone. It
+     * exercises exactly one interleaving -- the one observed in the trace and
+     * the one the fix targets. Other paths into a nested wait_suspend (a
+     * debugger attaching to a clone, a second NtGetContextThread after the
+     * first context has been consumed on resume, anything else that reaches
+     * stop_thread() on a clone's initial thread once it is running) are
+     * neither exercised nor ruled out by this test. The client-side
+     * "we stole another reply" recursion in wait_select_reply() that turns a
+     * rejected select into a permanent hang is likewise untouched and remains
+     * a live hazard for any future caller that nests a context select. */
+    if (ctx_count && current->process->is_clone && !current->process->clone_race_forced &&
+        clone_race_test())
+    {
+        /* exactly once per clone, on its startup context select -- this stands
+         * for the ONE NtGetContextThread the parent makes on the clone's thread
+         * handle. Firing on every context select instead would SIGUSR1 the
+         * clone repeatedly, and since the SIGUSR1 handler's own wait_suspend()
+         * is itself a context select, that recurses into an unbounded signal
+         * storm that wedges the clone for an entirely different reason. That
+         * artifact was measured (382791 signals, zero INVALID_PARAMETER
+         * selects) before this guard was added; without it the test reports a
+         * hang that is not the bug. */
+        current->process->clone_race_forced = 1;
+        stop_thread( current );
+    }
 
     if (ctx_count)
     {

@@ -118,6 +118,7 @@ extern client_ptr_t get_wait_queue_key( struct wait_queue_entry *entry );
 extern void make_wait_abandoned( struct wait_queue_entry *entry );
 extern void set_wait_status( struct wait_queue_entry *entry, int status );
 extern void stop_thread( struct thread *thread );
+extern void set_thread_pending_context( struct thread *thread );
 extern int wake_thread( struct thread *thread );
 extern int wake_thread_queue_entry( struct wait_queue_entry *entry );
 extern int add_queue( struct object *obj, struct wait_queue_entry *entry );
