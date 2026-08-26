@@ -652,7 +652,19 @@ int __cdecl wmain (int argc, WCHAR *argv[])
 
 done:
 	if (opts.sei.fMask & SEE_MASK_NOCLOSEPROCESS) {
-		DWORD exitcode;
+		/* Initialised on purpose, and only safe to initialise now.  This used to
+		 * be read uninitialised: for a native (non-PE) child, NtCreateUserProcess
+		 * returned STATUS_SUCCESS with a null ProcessHandle, GetExitCodeProcess
+		 * below then failed and never wrote it, and start.exe exited with stack
+		 * garbage -- measured as a constant 3 whether the child exited 0 or 1.
+		 * Until that was fixed, initialising this would have been the wrong fix:
+		 * it would have replaced visible garbage with a fabricated exit code
+		 * while the real status was still unknown to anybody.  The handle is now
+		 * a real, waitable process object (see "ntdll: Return a waitable process
+		 * object for a native unix child."), so the value below is only ever
+		 * reached if GetExitCodeProcess genuinely fails -- which is why it is a
+		 * loud non-zero rather than a silent 0. */
+		DWORD exitcode = 255;
 		HANDLE hJob;
 		JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
 
