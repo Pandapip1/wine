@@ -1,0 +1,71 @@
+Test images for .github/probes/pe-alignment-status.ps1
+=====================================================
+
+Four prebuilt PE32 executables used to ask one question of a real NT kernel:
+does it load a PE whose SectionAlignment is smaller than the page size?
+
+They are committed as binaries deliberately.  They are NOT generated at probe
+time: a generated image would measure this repo's generator, and the point of
+the probe is to measure NT.
+
+Source
+------
+hi.c (committed alongside, 51 bytes):
+
+    #include <windows.h>
+    int main(void) { return 42; }
+
+sha256 of hi.c: 2f61c6ada042773cdd7ac63a41a3c3c5cdbba5346300c9b08bb0d1638fd7c0da
+
+Producing toolchain
+-------------------
+Reported by the author of the images: tcc (the Tiny C Compiler), targeting
+win32/i386.
+
+This is REPORTED, not measured.  The binaries carry no embedded toolchain
+string (searched: no "tcc" substring anywhere in any of the four files), and
+they could not be reproduced on the machine that assembled this directory --
+its tcc is 0.9.27 (x86_64 Linux) with no win32 headers or crt, so it cannot
+emit a PE at all.  The exact tcc version and the exact link flags that set the
+sub-page alignments are therefore NOT established here.  The sha256 sums below
+are the identity of these files; the toolchain attribution is hearsay.
+
+What IS measured from the bytes (by python3 struct, on the files as copied):
+
+    file             size   Machine  Magic   SectAlign  FileAlign  SizeOfImage  Subsystem
+    default.exe      2048   0x014c   0x010b  0x1000     0x200      0x4000       3
+    subpage20.exe    1568   0x014c   0x010b  0x0020     0x0020     0x0460       3
+    subpage200.exe   2048   0x014c   0x010b  0x0200     0x0200     0x0a00       3
+    native20.exe     1568   0x014c   0x010b  0x0020     0x0020     0x0460       1
+
+    All four: e_lfanew=0x80, "PE\0\0", 3 sections (.text/.rdata/.bss),
+    SizeOfOptionalHeader=0xe0, LinkerVersion 6.0, TimeDateStamp=0,
+    imports from kernel32.dll and msvcrt.dll.
+
+    Machine 0x014c is i386 and Magic 0x010b is PE32.  All four cells share
+    that, so it is constant along the alignment axis -- but note that on an
+    x64 CI runner every CreateProcessW here goes through WOW64.
+
+sha256
+------
+489368b986ca21ae98486a2a7989a5e1fc756a17c6b80fb34b90401d5122b863  subpage20.exe
+75c10877d50bba918d3751701ef07457b789e1743433807aaf9eb18c438a9b5a  subpage200.exe
+a3f7b535e1bfc753d920478035eddc130c25fc1361321d5b6722a8e528cf1b2c  native20.exe
+b3b4817f4b8bf0688af96a2652f026ad71c19ed8d2ac82df38263f710d67ad0f  default.exe
+
+The probe recomputes these at run time on the runner and prints measured
+against expected, so a mangled checkout shows up as a hash mismatch rather
+than as a mysterious NTSTATUS.  .gitattributes here marks *.exe binary so no
+eol conversion can touch them.
+
+Roles
+-----
+default.exe      positive control.  Ordinary 0x1000/0x200 alignment.  If this
+                 does not map as SEC_IMAGE and launch, the harness is broken
+                 and the whole run is void.
+subpage200.exe   SectionAlignment == FileAlignment == 0x200.  This is the cell
+                 the probe exists for.
+subpage20.exe    SectionAlignment == FileAlignment == 0x20.
+native20.exe     Subsystem 1 (native).  Only meaningful on the
+                 NtCreateSection(SEC_IMAGE) axis; its CreateProcessW result
+                 says nothing about alignment.

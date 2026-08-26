@@ -29,3 +29,11 @@ jobs:
         if: always()
         shell: pwsh
         run: .github/probes/zero-data-cluster.ps1
+      - name: short .exe -> NTSTATUS
+        if: always()
+        shell: pwsh
+        run: .github/probes/short-exe-status.ps1
+      - name: sub-page SectionAlignment
+        if: always()
+        shell: pwsh
+        run: .github/probes/pe-alignment-status.ps1
