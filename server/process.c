@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <poll.h>
 #ifdef HAVE_SYS_PARAM_H
@@ -678,6 +679,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->rawinput_device_count = 0;
     process->rawinput_mouse  = NULL;
     process->rawinput_kbd    = NULL;
+    process->unix_relay      = NULL;
     memset( &process->image_info, 0, sizeof(process->image_info) );
     list_init( &process->rawinput_entry );
     list_init( &process->kernel_object );
@@ -780,6 +782,7 @@ static void process_destroy( struct object *obj )
     free( process->rawinput_devices );
     free( process->dir_cache );
     free( process->image );
+    free( process->unix_relay );
 }
 
 /* dump a process on stdout for debugging purposes */
@@ -853,12 +856,81 @@ static struct security_descriptor *process_get_sd( struct object *obj )
     return process_default_sd;
 }
 
+/* exit status relay for a native unix child (see create_unix_process)
+ *
+ * The child is orphaned onto init, so nothing here can waitpid() it.  A
+ * helper process that IS its parent does that instead and reports over a
+ * pipe, in two fixed-size messages: first the child's unix pid, then the
+ * raw wait(2) status.  The pipe read end lives in process->msg_fd, in place
+ * of the sendmsg/recvmsg socket an ordinary client process has -- so
+ * process_poll_event has to route it here rather than to receive_fd. */
+
+struct unix_relay
+{
+    int  buffer[2];   /* [0] = the child's unix pid, [1] = its raw wait status */
+    int  pos;         /* bytes received so far */
+};
+
+/* translate a unix wait(2) status the way a shell does, so that a caller
+ * reading GetExitCodeProcess sees the number the child actually exited
+ * with, and a signalled child is distinguishable from a clean 0. */
+static int unix_relay_exit_code( int status )
+{
+    if (WIFEXITED( status )) return WEXITSTATUS( status );
+    if (WIFSIGNALED( status )) return 128 + WTERMSIG( status );
+    return 255;
+}
+
+static void unix_relay_terminate( struct process *process, int exit_code )
+{
+    /* the child has already been reaped by the relay, so its pid may be
+     * reused at any moment: drop it before process_killed starts the
+     * SIGKILL watchdog, which would otherwise signal whatever now owns it.
+     * (While the child is alive, keeping it is the whole point -- that is
+     * what makes NtTerminateProcess work on this process object.) */
+    process->unix_pid = -1;
+    terminate_process( process, NULL, exit_code );
+}
+
+static void unix_relay_poll_event( struct process *process, int event )
+{
+    struct unix_relay *relay = process->unix_relay;
+    int fd = get_unix_fd( process->msg_fd );
+
+    while (event & POLLIN)
+    {
+        int ret = read( fd, (char *)relay->buffer + relay->pos, sizeof(relay->buffer) - relay->pos );
+
+        if (ret > 0)
+        {
+            relay->pos += ret;
+            /* the pid arrives first and on its own, so that the process is
+             * killable before the child has exited */
+            if (relay->pos >= (int)sizeof(int) && process->unix_pid == -1)
+                process->unix_pid = relay->buffer[0];
+            if (relay->pos < (int)sizeof(relay->buffer)) continue;
+            unix_relay_terminate( process, unix_relay_exit_code( relay->buffer[1] ) );
+            return;
+        }
+        if (ret < 0 && (errno == EINTR)) continue;
+        if (ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;  /* wait for more */
+        break;  /* 0 (EOF) or a real error: fall through to the hangup case */
+    }
+
+    /* POLLHUP/POLLERR, or EOF, without a complete status: the relay died
+     * before it could report.  Nothing will ever report now, so the process
+     * object has to be torn down here or it pins wineserver alive forever
+     * (it counts towards user_processes). */
+    unix_relay_terminate( process, 255 );
+}
+
 static void process_poll_event( struct fd *fd, int event )
 {
     struct process *process = get_fd_user( fd );
     assert( process->obj.ops == &process_ops );
 
-    if (event & (POLLERR | POLLHUP)) kill_process( process, !process->is_terminating );
+    if (process->unix_relay) unix_relay_poll_event( process, event );
+    else if (event & (POLLERR | POLLHUP)) kill_process( process, !process->is_terminating );
     else if (event & POLLIN) receive_fd( process );
 }
 
@@ -1548,6 +1620,88 @@ DECL_HANDLER(clone_process)
     }
     /* a handle didn't allocate: nothing else will ever kill this thread,
      * so this has to. */
+    kill_thread( thread, 1 );
+
+done:
+    release_object( process );
+}
+
+/* create a waitable process object standing for a native (non-PE) unix child
+ * that the caller has already forked -- see this request's own comment in
+ * protocol.def, and fork_and_exec in dlls/ntdll/unix/process.c for the relay
+ * on the other end of req->relay_fd. */
+DECL_HANDLER(create_unix_process)
+{
+    static const struct startup_info_data empty_info;
+    struct process *parent = current->process;
+    struct process *process = NULL;
+    struct thread *thread = NULL;
+    struct unix_relay *relay;
+    int relay_fd = thread_get_inflight_fd( current, req->relay_fd );
+
+    if (relay_fd == -1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    /* the poll handler reads until EAGAIN; it must never block the server */
+    if (fcntl( relay_fd, F_SETFL, O_NONBLOCK ) == -1)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        close( relay_fd );
+        return;
+    }
+    if (shutdown_stage)
+    {
+        set_error( STATUS_SHUTDOWN_IN_PROGRESS );
+        close( relay_fd );
+        return;
+    }
+    if (!(relay = mem_alloc( sizeof(*relay) )))
+    {
+        close( relay_fd );
+        return;
+    }
+    memset( relay, 0, sizeof(*relay) );
+
+    /* the pipe read end takes the place of the msg_fd socket: create_process
+     * only ever hands it to create_anonymous_fd( &process_fd_ops, ... ) and
+     * listens for POLLIN on it, which is exactly what is wanted here. */
+    if (!(process = create_process( relay_fd, parent, 0, &empty_info, NULL, NULL, 0, NULL )))
+    {
+        free( relay );
+        return;
+    }
+    process->unix_relay = relay;
+    process->machine = parent->machine;
+    /* nothing will ever connect to this process and run init_process_done on
+     * it; it is "started" from the moment it exists. */
+    process->startup_state = STARTUP_DONE;
+
+    if (!(thread = create_thread( -1, process, NULL )))
+    {
+        /* create_thread does not always set one (send_client_fd failing, say) */
+        if (!get_error()) set_error( STATUS_NO_MEMORY );
+        goto done;
+    }
+    add_process_thread( process, thread );
+
+    reply->pid = get_process_id( process );
+    reply->tid = get_thread_id( thread );
+    if ((reply->process_handle = alloc_handle_no_access_check( current->process, process,
+                                                               PROCESS_ALL_ACCESS, 0 )))
+    {
+        if ((reply->thread_handle = alloc_handle_no_access_check( current->process, thread,
+                                                                  THREAD_ALL_ACCESS, 0 )))
+        {
+            release_object( process );
+            return;
+        }
+        close_handle( current->process, reply->process_handle );
+    }
+    /* a handle didn't allocate: nothing else will ever kill this thread, and
+     * the process object counts towards user_processes, so it would pin
+     * wineserver alive forever. */
     kill_thread( thread, 1 );
 
 done:

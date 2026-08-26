@@ -3564,6 +3564,19 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
     fprintf( stderr, " handle=%04x", req->handle );
 }
 
+static void dump_create_unix_process_request( const struct create_unix_process_request *req )
+{
+    fprintf( stderr, " relay_fd=%d", req->relay_fd );
+}
+
+static void dump_create_unix_process_reply( const struct create_unix_process_reply *req )
+{
+    fprintf( stderr, " pid=%04x", req->pid );
+    fprintf( stderr, ", tid=%04x", req->tid );
+    fprintf( stderr, ", process_handle=%04x", req->process_handle );
+    fprintf( stderr, ", thread_handle=%04x", req->thread_handle );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3878,6 +3891,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
+    (dump_func)dump_create_unix_process_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4192,6 +4206,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
+    (dump_func)dump_create_unix_process_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4506,6 +4521,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "alpc_create_port",
+    "create_unix_process",
 };
 
 static const struct

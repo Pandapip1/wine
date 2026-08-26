@@ -6290,6 +6290,47 @@ struct alpc_create_port_reply
 };
 
 
+/* NOTE: deliberately last in this file.  Inserting a request anywhere else
+ * renumbers every request after it, and prebuilt PE modules make server calls
+ * of their own -- ntoskrnl.exe's kernel_object_from_handle, for one -- so a
+ * mid-file insertion silently misdirects their requests until every one of
+ * them is rebuilt.  Append; never insert.
+ *
+ * Create a process object standing for a native (non-PE) unix child.
+ *
+ * NtCreateUserProcess on a non-PE image escapes to fork()/execv() on the
+ * host (dlls/ntdll/unix/process.c, fork_and_exec).  The resulting unix
+ * process is deliberately orphaned onto init/the subreaper, so neither the
+ * caller nor wineserver is its parent and neither can ever waitpid() it --
+ * which is why that path used to return STATUS_SUCCESS with a null
+ * ProcessHandle, a null ThreadHandle and a zeroed ClientId, something real
+ * NT never does.  The client works around the orphaning with a "status
+ * relay": an extra intermediate process that does stay the child's parent,
+ * writes the child's unix pid down a pipe, waitpid()s it, then writes the
+ * raw wait status and exits.  This request hands wineserver the read end of
+ * that pipe and gets back a real, waitable process object: the relayed exit
+ * status becomes the process exit code, and EOF on the pipe terminates it.
+ *
+ * There is no new server-side object type: the pipe read end takes the place
+ * of the msg_fd socket an ordinary process is created with, and a single
+ * threadless-client thread (create_thread( -1, ... ), as clone_process also
+ * uses) carries the exit code, so remove_process_thread does the usual
+ * signalling and both WaitForSingleObject and GetExitCodeProcess work. */
+struct create_unix_process_request
+{
+    struct request_header __header;
+    int          relay_fd;
+};
+struct create_unix_process_reply
+{
+    struct reply_header __header;
+    process_id_t pid;
+    thread_id_t  tid;
+    obj_handle_t process_handle;
+    obj_handle_t thread_handle;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6602,6 +6643,7 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_alpc_create_port,
+    REQ_create_unix_process,
     REQ_NB_REQUESTS
 };
 
@@ -6919,6 +6961,7 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct alpc_create_port_request alpc_create_port_request;
+    struct create_unix_process_request create_unix_process_request;
 };
 union generic_reply
 {
@@ -7234,8 +7277,9 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
+    struct create_unix_process_reply create_unix_process_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 965
+#define SERVER_PROTOCOL_VERSION 967
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

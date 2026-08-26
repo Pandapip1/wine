@@ -25,6 +25,7 @@
 
 #include "config.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -40,6 +41,9 @@
 #endif
 #include <sys/types.h>
 #include <sys/wait.h>
+#ifdef HAVE_SYS_SYSCALL_H
+# include <sys/syscall.h>
+#endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -686,18 +690,148 @@ static void start_stdio_pump( struct stdio_pump *pump )
 
 
 /***********************************************************************
+ *           exit status relay
+ *
+ * A unix binary started through NtCreateUserProcess is deliberately orphaned
+ * (see fork_and_exec below): the process that forked it exits at once, so the
+ * child is reparented onto init or the nearest subreaper.  Neither the caller
+ * nor wineserver is ever its parent, and only a parent may waitpid() it --
+ * pidfd_open() would give exit notification for a non-child, but
+ * waitid( P_PIDFD, ... ) on one returns ECHILD, so not the status.  That is
+ * why this path used to return STATUS_SUCCESS with a null ProcessHandle, a
+ * null ThreadHandle and a zeroed ClientId: there was nothing to hand back,
+ * not even a pid.
+ *
+ * So keep one process that IS the child's parent.  It holds no Wine state, it
+ * only reports: the child's unix pid first (so the process object is killable
+ * before the child exits), then the raw wait status, down a pipe whose read
+ * end wineserver polls.  A permanently sleeping relay process per escaped
+ * child is the price of never being able to reap an orphan.
+ */
+
+/* Drop every descriptor above last_kept.  The relay outlives the whole
+ * CreateProcess call, so anything it still holds is held for the child's
+ * entire lifetime -- in particular the caller's wineserver socket (wineserver
+ * notices a client's death by POLLHUP on it) and the write end of the stdout
+ * pump's pipe (closing every copy of it is what gives the pump its EOF).
+ * Marking those close-on-exec is no help: the relay never execs. */
+static void close_inherited_fds( int last_kept )
+{
+    int i, max;
+
+#if defined(HAVE_SYS_SYSCALL_H) && defined(SYS_close_range)
+    if (!syscall( SYS_close_range, last_kept + 1, ~0U, 0 )) return;
+#endif
+    {
+        DIR *dir = opendir( "/proc/self/fd" );
+
+        if (dir)
+        {
+            int dir_fd = dirfd( dir );
+            struct dirent *de;
+
+            while ((de = readdir( dir )))
+            {
+                i = atoi( de->d_name );
+                if (i > last_kept && i != dir_fd) close( i );
+            }
+            closedir( dir );
+            return;
+        }
+    }
+    max = getdtablesize();
+    if (max > 65536) max = 65536;  /* RLIMIT_NOFILE can be enormous; this is a last resort */
+    for (i = last_kept + 1; i < max; i++) close( i );
+}
+
+static void exit_status_relay( pid_t pid, int relay_fd, int err_fd )
+{
+    int status = 0, value = pid;
+    pid_t wret;
+
+    /* the caller blocks reading the error pipe until every copy of its write
+     * end is gone; the child's went with its exec, this is the other one */
+    close( err_fd );
+
+    if (relay_fd != 3)
+    {
+        dup2( relay_fd, 3 );
+        close( relay_fd );
+        relay_fd = 3;
+    }
+    close_inherited_fds( relay_fd );
+    /* the caller's own stdio is none of the relay's business, and holding on to
+     * it would defer EOF on a pipe the caller's parent is reading until the
+     * child exits.  set_stdio_fd() only covers 0 and 1, so do all three here. */
+    {
+        int null_fd = open( "/dev/null", O_RDWR );
+
+        if (null_fd != -1)
+        {
+            dup2( null_fd, 0 );
+            dup2( null_fd, 1 );
+            dup2( null_fd, 2 );
+            if (null_fd > 2) close( null_fd );
+        }
+    }
+
+    /* SIG_IGN here would have the kernel reap the child itself and leave
+     * waitpid() nothing to return */
+    signal( SIGCHLD, SIG_DFL );
+    signal( SIGPIPE, SIG_IGN );  /* the caller may go away before the child does */
+
+    write( relay_fd, &value, sizeof(value) );
+
+    do { wret = waitpid( pid, &status, 0 ); }
+    while (wret < 0 && errno == EINTR);
+
+    if (wret == pid) write( relay_fd, &status, sizeof(status) );
+    _exit(0);
+}
+
+/* Hand the relay's read end to wineserver and get back a real, waitable
+ * process object for the unix child. */
+static NTSTATUS create_unix_process_object( int relay_fd, HANDLE *process_handle, HANDLE *thread_handle,
+                                            ULONG *process_id, ULONG *thread_id )
+{
+    unsigned int status;
+
+    wine_server_send_fd( relay_fd );
+
+    SERVER_START_REQ( create_unix_process )
+    {
+        req->relay_fd = relay_fd;
+        if (!(status = wine_server_call( req )))
+        {
+            *process_handle = wine_server_ptr_handle( reply->process_handle );
+            *thread_handle  = wine_server_ptr_handle( reply->thread_handle );
+            *process_id     = reply->pid;
+            *thread_id      = reply->tid;
+        }
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+
+/***********************************************************************
  *           fork_and_exec
  *
  * Fork and exec a new Unix binary, checking for errors.
  */
 static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
-                               const RTL_USER_PROCESS_PARAMETERS *params )
+                               const RTL_USER_PROCESS_PARAMETERS *params,
+                               HANDLE *process_handle, HANDLE *thread_handle,
+                               ULONG *process_id, ULONG *thread_id )
 {
     pid_t pid;
-    int fd[2], stdin_fd = -1, stdout_fd = -1;
+    int fd[2], relay[2], stdin_fd = -1, stdout_fd = -1;
     struct stdio_pump *stdout_pump = NULL;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
+
+    *process_handle = *thread_handle = 0;
+    *process_id = *thread_id = 0;
 
 #ifdef HAVE_PIPE2
     if (pipe2( fd, O_CLOEXEC ) == -1)
@@ -707,6 +841,20 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
     }
+
+    /* a socketpair rather than a pipe: wineserver's create_thread() answers a
+     * request_fd of -1 by sendmsg()ing the new thread's request pipe back over
+     * the process's msg_fd, which is the descriptor handed over below -- on a
+     * plain pipe that fails with ENOTSOCK and the whole request is refused.
+     * Nothing ever reads what the server writes there; the relay only writes. */
+    if (socketpair( PF_UNIX, SOCK_STREAM, 0, relay ) == -1)
+    {
+        close( fd[0] );
+        close( fd[1] );
+        return STATUS_TOO_MANY_OPENED_FILES;
+    }
+    fcntl( relay[0], F_SETFD, FD_CLOEXEC );
+    fcntl( relay[1], F_SETFD, FD_CLOEXEC );
 
     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
         isatty(0) && is_unix_console_handle( params->hStdInput ))
@@ -720,41 +868,58 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
      * though the caller did supply a handle; pump the bytes across instead */
     if (stdout_fd == -1) stdout_fd = alloc_stdio_pump( params->hStdOutput, &stdout_pump );
 
+    /* Three forks, not two: the caller's own child (C) must exit immediately so
+     * that the waitpid() below returns at once and leaves no zombie, and the
+     * unix binary (G) must be orphaned rather than left a child of a PE process
+     * that will never reap it.  That leaves nobody able to waitpid() G, so C
+     * forks one more level: the middle process (the relay) stays G's parent for
+     * G's whole life and does nothing but report its exit status. */
     if (!(pid = fork()))  /* child */
     {
-        if (!(pid = fork()))  /* grandchild */
+        close( relay[0] );
+
+        if (!(pid = fork()))  /* status relay */
         {
-            close( fd[0] );
-            if (stdout_pump) close( stdout_pump->fd );
-
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
-                params->ConsoleHandle == NULL)
+            if (!(pid = fork()))  /* grandchild */
             {
-                setsid();
+                close( fd[0] );
+                close( relay[1] );
+                if (stdout_pump) close( stdout_pump->fd );
+
+                if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                    params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                    params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                    params->ConsoleHandle == NULL)
+                {
+                    setsid();
+                }
+                /* the new session/process group only decides terminal ownership; it must
+                 * not discard standard handles the caller actually supplied.  Handles the
+                 * caller did not supply are still -1 here and fall back to /dev/null. */
+                set_stdio_fd( stdin_fd, stdout_fd );
+
+                if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+                if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+
+                /* Reset signals that we previously set to SIG_IGN */
+                signal( SIGPIPE, SIG_DFL );
+
+                argv = build_argv( &params->CommandLine, 0 );
+                if (unixdir != -1)
+                {
+                    fchdir( unixdir );
+                    close( unixdir );
+                }
+                execv( unix_name, argv );
             }
-            /* the new session/process group only decides terminal ownership; it must
-             * not discard standard handles the caller actually supplied.  Handles the
-             * caller did not supply are still -1 here and fall back to /dev/null. */
-            set_stdio_fd( stdin_fd, stdout_fd );
 
-            if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
-            if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
-
-            /* Reset signals that we previously set to SIG_IGN */
-            signal( SIGPIPE, SIG_DFL );
-
-            argv = build_argv( &params->CommandLine, 0 );
-            if (unixdir != -1)
-            {
-                fchdir( unixdir );
-                close( unixdir );
-            }
-            execv( unix_name, argv );
+            /* in the relay, with the grandchild running: never returns */
+            if (pid > 0) exit_status_relay( pid, relay[1], fd[1] );
         }
+        else if (pid > 0) _exit(0);  /* the intermediate child, done as soon as the relay exists */
 
-        if (pid <= 0)  /* grandchild if exec failed or child if fork failed */
+        /* here only on a failure: pid == 0 is the grandchild whose exec failed,
+         * pid == -1 is a fork that failed in the intermediate child or the relay */
         {
             switch (errno)
             {
@@ -770,9 +935,9 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
             write( fd[1], &status, sizeof(status) );
             _exit(1);
         }
-        _exit(0); /* child if fork succeeded */
     }
     close( fd[1] );
+    close( relay[1] );
 
     if (pid != -1)
     {
@@ -781,7 +946,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         do {
             wret = waitpid(pid, NULL, 0);
         } while (wret < 0 && errno == EINTR);
-        read( fd[0], &status, sizeof(status) );  /* if we read something, exec or second fork failed */
+        read( fd[0], &status, sizeof(status) );  /* if we read something, exec or a fork failed */
     }
     else status = STATUS_NO_MEMORY;
 
@@ -795,6 +960,13 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         if (!status) start_stdio_pump( stdout_pump );
         else free_stdio_pump( stdout_pump );
     }
+
+    if (!status &&
+        (status = create_unix_process_object( relay[0], process_handle, thread_handle,
+                                              process_id, thread_id )))
+        ERR( "failed to create a process object for %s, status %#x\n", debugstr_a(unix_name), status );
+
+    close( relay[0] );
     return status;
 }
 
@@ -905,13 +1077,34 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
     if ((status = get_pe_file_info( &attr, &nt_name, &unix_name, &file_handle, &pe_info )))
     {
-        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params ))
+        if (status == STATUS_INVALID_IMAGE_NOT_MZ)
         {
-            *process_handle_ptr = *thread_handle_ptr = 0;
-            memset( info, 0, sizeof(*info) );
-            free( unix_name );
-            free( nt_name.Buffer );
-            return STATUS_SUCCESS;
+            HANDLE unix_process = 0, unix_thread = 0;
+            ULONG unix_pid = 0, unix_tid = 0;
+
+            if (!fork_and_exec( &attr, unix_name, unixdir, params,
+                                &unix_process, &unix_thread, &unix_pid, &unix_tid ))
+            {
+                /* the ClientId of a unix child is its wineserver ptid, not its
+                 * unix pid: NT process ids are server ptids everywhere else too,
+                 * and a unix pid would not resolve through NtOpenProcess. */
+                for (i = 0; i < attr_count; i++)
+                {
+                    if (ps_attr->Attributes[i].Attribute == PS_ATTRIBUTE_CLIENT_ID)
+                    {
+                        CLIENT_ID id = make_client_id( unix_pid, unix_tid );
+                        SIZE_T size = min( ps_attr->Attributes[i].Size, sizeof(id) );
+                        memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
+                        if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
+                    }
+                }
+                *process_handle_ptr = unix_process;
+                *thread_handle_ptr = unix_thread;
+                memset( info, 0, sizeof(*info) );
+                free( unix_name );
+                free( nt_name.Buffer );
+                return STATUS_SUCCESS;
+            }
         }
         goto done;
     }

@@ -27,6 +27,7 @@ struct atom_table;
 struct handle_table;
 struct startup_info;
 struct job;
+struct unix_relay;
 
 /* process startup state */
 enum startup_state { STARTUP_IN_PROGRESS, STARTUP_DONE, STARTUP_ABORTED };
@@ -92,6 +93,7 @@ struct process
     struct list          rawinput_entry;  /* entry in the rawinput process list */
     struct list          kernel_object;   /* list of kernel object pointers */
     struct pe_image_info image_info;      /* main exe image info */
+    struct unix_relay   *unix_relay;      /* exit status relay, for a native unix child (create_unix_process) */
 };
 
 /* process functions */
