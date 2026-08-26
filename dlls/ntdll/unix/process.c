@@ -152,7 +152,7 @@ static char **build_argv( const UNICODE_STRING *cmdline, int reserved )
 /***********************************************************************
  *           get_non_pe_file_info
  */
-static NTSTATUS get_non_pe_file_info( int fd, struct pe_image_info *info )
+static NTSTATUS get_non_pe_file_info( int fd, const char *unix_name, struct pe_image_info *info )
 {
     union
     {
@@ -194,8 +194,23 @@ static NTSTATUS get_non_pe_file_info( int fd, struct pe_image_info *info )
     } header;
 
     off_t pos;
+    ssize_t len;
 
-    if (pread( fd, &header, sizeof(header), 0 ) != sizeof(header)) return STATUS_INVALID_IMAGE_NOT_MZ;
+    if ((len = pread( fd, &header, sizeof(header), 0 )) != sizeof(header))
+    {
+        /* pread() at offset 0 returns min(file size, sizeof(header)), so a
+         * short read is the whole file: it cannot hold an executable header of
+         * any format.  Such a file is never a legitimate exec target -- it was
+         * truncated or never written (a writer that hit ENOSPC leaves exactly
+         * this, a zero-length file that looks real in a directory listing).
+         * We still return NOT_MZ, which sends it down the escape-to-native-host
+         * path and execv()s it as a unix binary; say so, because that failure
+         * is otherwise silent. */
+        WARN( "%s is %zd bytes, too short to be an executable of any format "
+              "(truncated or never written?); about to try exec'ing it as a native unix binary\n",
+              debugstr_a( unix_name ), len );
+        return STATUS_INVALID_IMAGE_NOT_MZ;
+    }
 
     if (!memcmp( header.elf.magic, "\177ELF", 4 ))
     {
@@ -300,7 +315,7 @@ static unsigned int get_pe_file_info( OBJECT_ATTRIBUTES *attr, UNICODE_STRING *n
 
         if (!server_get_unix_fd( *handle, FILE_READ_DATA, &unix_fd, &needs_close, NULL, NULL ))
         {
-            status = get_non_pe_file_info( unix_fd, info );
+            status = get_non_pe_file_info( unix_fd, *unix_name, info );
             if (needs_close) close( unix_fd );
         }
     }
@@ -1235,6 +1250,12 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         {
             HANDLE unix_process = 0, unix_thread = 0;
             ULONG unix_pid = 0, unix_tid = 0;
+
+            /* not a PE image: escape to the host and run it as a native unix
+             * binary.  Expected for a real unix executable, so TRACE not WARN;
+             * get_non_pe_file_info() WARNs separately for a file too short to
+             * have a header at all. */
+            TRACE( "not a PE image, exec'ing %s as a native unix binary\n", debugstr_a( unix_name ) );
 
             if (!fork_and_exec( &attr, unix_name, unixdir, params,
                                 &unix_process, &unix_thread, &unix_pid, &unix_tid ))
