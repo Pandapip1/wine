@@ -1201,6 +1201,44 @@ struct clone_process_reply
 };
 
 
+/* Create a process object standing in for a native (non-PE) unix child.
+ *
+ * The escape path in dlls/ntdll/unix/process.c (get_pe_file_info() answering
+ * STATUS_INVALID_IMAGE_NOT_MZ -> fork_and_exec()) execs a plain unix binary,
+ * which has no wine client and therefore nothing for wineserver to hold on to:
+ * NtCreateUserProcess used to return STATUS_SUCCESS with a null ProcessHandle,
+ * so no caller could ever wait on it or read its exit status.
+ *
+ * The child cannot be waited for directly.  fork_and_exec deliberately orphans
+ * it -- the wine process is its grandparent, not its parent -- so neither wine
+ * nor wineserver may call waitpid(2) on it, and pidfd_open(2) gives exit
+ * notification for a non-child but not the status (waitid(P_PIDFD) on a
+ * non-child answers ECHILD).  So the client leaves a relay process behind that
+ * IS the child's parent; the relay writes the child's unix pid down a pipe,
+ * waitpid()s it, writes the raw wait(2) status, and exits.  This request hands
+ * wineserver the read end of that pipe.
+ *
+ * The process object built over it carries one dummy thread that never runs.
+ * When the status arrives that thread is killed with the translated exit code,
+ * which is what remove_process_thread() copies into process->exit_code and what
+ * signals the process, giving both a working WaitForSingleObject and a working
+ * GetExitCodeProcess.  The relayed unix pid is stored as process->unix_pid, so
+ * NtTerminateProcess reaches the real child too. */
+struct create_unix_process_request
+{
+    struct request_header __header;
+    int          relay_fd;
+};
+struct create_unix_process_reply
+{
+    struct reply_header __header;
+    process_id_t pid;
+    obj_handle_t process_handle;
+    obj_handle_t thread_handle;
+    thread_id_t  tid;
+};
+
+
 
 struct get_startup_info_request
 {
@@ -6296,6 +6334,7 @@ enum request
     REQ_get_new_process_info,
     REQ_new_thread,
     REQ_clone_process,
+    REQ_create_unix_process,
     REQ_get_startup_info,
     REQ_init_process_done,
     REQ_init_first_thread,
@@ -6613,6 +6652,7 @@ union generic_request
     struct get_new_process_info_request get_new_process_info_request;
     struct new_thread_request new_thread_request;
     struct clone_process_request clone_process_request;
+    struct create_unix_process_request create_unix_process_request;
     struct get_startup_info_request get_startup_info_request;
     struct init_process_done_request init_process_done_request;
     struct init_first_thread_request init_first_thread_request;
@@ -6928,6 +6968,7 @@ union generic_reply
     struct get_new_process_info_reply get_new_process_info_reply;
     struct new_thread_reply new_thread_reply;
     struct clone_process_reply clone_process_reply;
+    struct create_unix_process_reply create_unix_process_reply;
     struct get_startup_info_reply get_startup_info_reply;
     struct init_process_done_reply init_process_done_reply;
     struct init_first_thread_reply init_first_thread_reply;
@@ -7236,6 +7277,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 965
+#define SERVER_PROTOCOL_VERSION 966
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

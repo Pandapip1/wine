@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <poll.h>
 #ifdef HAVE_SYS_PARAM_H
@@ -661,6 +662,10 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->is_system       = 0;
     process->debug_children  = 1;
     process->is_terminating  = 0;
+    process->unix_relay      = 0;
+    process->relay_pos       = 0;
+    process->relay_data[0]   = 0;
+    process->relay_data[1]   = 0;
     process->imagelen        = 0;
     process->image           = NULL;
     process->job             = NULL;
@@ -853,11 +858,82 @@ static struct security_descriptor *process_get_sd( struct object *obj )
     return process_default_sd;
 }
 
+/* translate a raw wait(2) status into an NT exit code */
+static int exit_code_from_wait_status( int status )
+{
+    if (WIFEXITED( status )) return WEXITSTATUS( status );
+    if (WIFSIGNALED( status )) return 128 + WTERMSIG( status );
+    return 255;
+}
+
+/* kill the dummy thread standing in for a relayed native unix child, and with
+ * it the process object, carrying the child's exit code: remove_process_thread
+ * copies thread->exit_code into process->exit_code and signals process->sync,
+ * which is what makes both WaitForSingleObject and GetExitCodeProcess work. */
+static void kill_unix_process( struct process *process, int exit_code )
+{
+    struct list *ptr;
+    struct thread *thread;
+
+    /* nothing more will ever be read from the relay, and the fd must stop
+     * generating events before the process object goes away underneath it */
+    set_fd_events( process->msg_fd, -1 );
+
+    if (!(ptr = list_head( &process->thread_list ))) return;  /* already dead */
+    thread = LIST_ENTRY( ptr, struct thread, proc_entry );
+    thread->exit_code = exit_code;
+    kill_thread( thread, 0 );
+}
+
+/* handle an event on the pipe a relay process writes a native unix child's pid
+ * and exit status to -- see create_unix_process in protocol.def */
+static void unix_relay_poll_event( struct process *process, int event )
+{
+    if (event & POLLIN)
+    {
+        int ret = read( get_unix_fd( process->msg_fd ),
+                        (char *)process->relay_data + process->relay_pos,
+                        sizeof(process->relay_data) - process->relay_pos );
+
+        if (ret < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            ret = 0;  /* treat a broken relay as an early EOF */
+        }
+        if (ret > 0)
+        {
+            process->relay_pos += ret;
+            /* first int: the child's unix pid, so NtTerminateProcess can reach it */
+            if (process->relay_pos >= (int)sizeof(int) && process->unix_pid == -1)
+                process->unix_pid = process->relay_data[0];
+            if (process->relay_pos < (int)sizeof(process->relay_data)) return;
+            /* second int: the raw wait(2) status.  The child has been reaped by
+             * the relay, so its pid is free for reuse -- forget it before the
+             * sigkill watchdog can aim at whatever inherits it next. */
+            process->unix_pid = -1;
+            kill_unix_process( process, exit_code_from_wait_status( process->relay_data[1] ) );
+            return;
+        }
+        event |= POLLHUP;
+    }
+    if (event & (POLLERR | POLLHUP))
+    {
+        /* the relay died without reporting a status: the child's fate is
+         * genuinely unknown, so say so rather than inventing a success */
+        kill_unix_process( process, 255 );
+    }
+}
+
 static void process_poll_event( struct fd *fd, int event )
 {
     struct process *process = get_fd_user( fd );
     assert( process->obj.ops == &process_ops );
 
+    if (process->unix_relay)
+    {
+        unix_relay_poll_event( process, event );
+        return;
+    }
     if (event & (POLLERR | POLLHUP)) kill_process( process, !process->is_terminating );
     else if (event & POLLIN) receive_fd( process );
 }
@@ -1549,6 +1625,87 @@ DECL_HANDLER(clone_process)
     /* a handle didn't allocate: nothing else will ever kill this thread,
      * so this has to. */
     kill_thread( thread, 1 );
+
+done:
+    release_object( process );
+}
+
+/* create a process object standing in for a native (non-PE) unix child, whose
+ * pid and exit status are relayed over a pipe -- see protocol.def for why the
+ * child cannot simply be waited for */
+DECL_HANDLER(create_unix_process)
+{
+    struct process *process = NULL;
+    struct thread *thread;
+    int relay_fd = thread_get_inflight_fd( current, req->relay_fd );
+    int dummy_fd[2];
+
+    if (relay_fd == -1)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (fcntl( relay_fd, F_SETFL, O_NONBLOCK ) == -1)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        close( relay_fd );
+        return;
+    }
+    if (shutdown_stage)
+    {
+        set_error( STATUS_SHUTDOWN_IN_PROGRESS );
+        close( relay_fd );
+        return;
+    }
+    {
+        /* create_process only reads its info_data argument for std_handles, and
+         * only when the handles array is non-NULL, which it is not here (the
+         * child is not a wine process and has no handle table to seed) */
+        static const struct startup_info_data empty_info;
+
+        if (!(process = create_process( relay_fd, current->process, 0, &empty_info,
+                                        NULL, NULL, 0, NULL )))
+            return;
+    }
+    process->unix_relay    = 1;
+    process->machine       = current->process->machine;
+    process->startup_state = STARTUP_DONE;  /* nothing is ever going to start up */
+
+    /* The dummy thread needs an fd of its own because create_thread( -1, ... )
+     * would send_client_fd() a request pipe down process->msg_fd -- which here
+     * is the relay pipe, not a socket, so the sendmsg would fail and take the
+     * brand new process down with it.  Hand it a pipe read end whose write end
+     * is already closed and then unregister it: nothing will ever be read from
+     * or written to it, and the thread is killed explicitly by the relay code
+     * above rather than by an event on it. */
+    if (pipe( dummy_fd ) == -1)
+    {
+        file_set_error();
+        goto done;
+    }
+    close( dummy_fd[1] );
+    if (!(thread = create_thread( dummy_fd[0], process, NULL ))) goto done;
+    set_fd_events( thread->request_fd, -1 );
+    add_process_thread( process, thread );
+
+    reply->pid = get_process_id( process );
+    reply->tid = get_thread_id( thread );
+    if ((reply->process_handle = alloc_handle_no_access_check( current->process, process,
+                                                               PROCESS_ALL_ACCESS, 0 )))
+    {
+        if ((reply->thread_handle = alloc_handle_no_access_check( current->process, thread,
+                                                                  THREAD_ALL_ACCESS, 0 )))
+        {
+            /* create_process's own reference belongs to this handler, exactly as
+             * in new_process and clone_process; without dropping it the object
+             * (and the relay's slot in user_processes) would outlive the session */
+            release_object( process );
+            return;
+        }
+        close_handle( current->process, reply->process_handle );
+    }
+    /* no handle got out, so nothing else will ever kill this thread */
+    kill_thread( thread, 0 );
 
 done:
     release_object( process );

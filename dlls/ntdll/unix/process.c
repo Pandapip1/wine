@@ -686,15 +686,88 @@ static void start_stdio_pump( struct stdio_pump *pump )
 
 
 /***********************************************************************
+ *           close_inherited_fds
+ *
+ * Close everything a forked child inherited except one descriptor.  The relay
+ * process below never execs, so FD_CLOEXEC does nothing for it, and it outlives
+ * the wine process that forked it: keeping that process's wineserver socket (or
+ * any of its per-thread server pipes) open would leave wineserver believing the
+ * caller is still alive long after it exits.
+ */
+static void close_inherited_fds( int keep )
+{
+    long i, max = sysconf( _SC_OPEN_MAX );
+
+    if (max < 0 || max > 65536) max = 65536;
+    for (i = 0; i < max; i++) if (i != keep) close( i );
+}
+
+
+/***********************************************************************
+ *           relay_child_status
+ *
+ * Body of the relay process: report the child's unix pid, wait for it, report
+ * its raw wait(2) status, and go away.  Never returns.
+ *
+ * This exists because the child is deliberately orphaned -- fork_and_exec forks
+ * twice over so that it is not left as a zombie of a process that never calls
+ * waitpid(2) -- and an orphan's exit status is retrievable by nobody but its
+ * parent.  pidfd_open(2) would give wineserver exit *notification* for a
+ * non-child, but waitid(P_PIDFD) on a non-child answers ECHILD, so not the
+ * status.  Somebody therefore has to stay behind and be the parent; this is it.
+ */
+static void relay_child_status( pid_t child, int relay_fd )
+{
+    int msg, status = 0;
+    pid_t ret;
+
+    /* the caller blocks in read() on the error pipe until every copy of its
+     * write end is gone, so this must not keep one; nor may it keep anything
+     * else it inherited (see close_inherited_fds), including the caller's copy
+     * of the stdout pump's read end, which the pump needs closed to see EOF */
+    close_inherited_fds( relay_fd );
+
+    msg = child;
+    write( relay_fd, &msg, sizeof(msg) );
+
+    do { ret = waitpid( child, &status, 0 ); } while (ret < 0 && errno == EINTR);
+    if (ret < 0) _exit(1);  /* no status to report: the reader gets EOF instead */
+
+    msg = status;
+    write( relay_fd, &msg, sizeof(msg) );
+    _exit(0);
+}
+
+
+/***********************************************************************
  *           fork_and_exec
  *
  * Fork and exec a new Unix binary, checking for errors.
+ *
+ * Three forks, not two.  The caller needs a process object it can wait on and
+ * read an exit code from, but the exec'd binary is not a wine process and is
+ * orphaned on purpose, so neither wine nor wineserver can ever waitpid() it.
+ * The middle child therefore forks once more and stays behind as a status relay:
+ *
+ *   parent -> C  : _exit(0) at once, so the parent's waitpid below still returns
+ *                  immediately and leaves no zombie, exactly as before
+ *   C      -> C2 : orphaned by C's exit, reparented to init or the subreaper, and
+ *                  the real parent of the exec'd child -- so it, and only it, can
+ *                  waitpid() for the status
+ *   C2     -> G  : execs the unix binary
+ *
+ * C2 writes G's pid and then G's raw wait status down a pipe whose read end goes
+ * to wineserver (create_unix_process), which turns them into a real process
+ * object.  The extra sleeping process is the price of never being able to reap
+ * an orphan.
  */
 static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, int unixdir,
-                               const RTL_USER_PROCESS_PARAMETERS *params )
+                               const RTL_USER_PROCESS_PARAMETERS *params,
+                               HANDLE *process_handle, HANDLE *thread_handle,
+                               ULONG *process_id, ULONG *thread_id )
 {
     pid_t pid;
-    int fd[2], stdin_fd = -1, stdout_fd = -1;
+    int fd[2], relay[2], stdin_fd = -1, stdout_fd = -1;
     struct stdio_pump *stdout_pump = NULL;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
@@ -706,6 +779,12 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         if (pipe(fd) == -1) return STATUS_TOO_MANY_OPENED_FILES;
         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
+    }
+    if (server_pipe( relay ) == -1)
+    {
+        close( fd[0] );
+        close( fd[1] );
+        return STATUS_TOO_MANY_OPENED_FILES;
     }
 
     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
@@ -722,39 +801,51 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 
     if (!(pid = fork()))  /* child */
     {
-        if (!(pid = fork()))  /* grandchild */
+        if (!(pid = fork()))  /* relay child */
         {
-            close( fd[0] );
-            if (stdout_pump) close( stdout_pump->fd );
+            close( relay[0] );
 
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
-                params->ConsoleHandle == NULL)
+            if (!(pid = fork()))  /* grandchild */
             {
-                setsid();
+                close( relay[1] );
+                close( fd[0] );
+                if (stdout_pump) close( stdout_pump->fd );
+
+                if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                    params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                    params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                    params->ConsoleHandle == NULL)
+                {
+                    setsid();
+                }
+                /* the new session/process group only decides terminal ownership; it must
+                 * not discard standard handles the caller actually supplied.  Handles the
+                 * caller did not supply are still -1 here and fall back to /dev/null. */
+                set_stdio_fd( stdin_fd, stdout_fd );
+
+                if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
+                if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+
+                /* Reset signals that we previously set to SIG_IGN */
+                signal( SIGPIPE, SIG_DFL );
+
+                argv = build_argv( &params->CommandLine, 0 );
+                if (unixdir != -1)
+                {
+                    fchdir( unixdir );
+                    close( unixdir );
+                }
+                execv( unix_name, argv );
             }
-            /* the new session/process group only decides terminal ownership; it must
-             * not discard standard handles the caller actually supplied.  Handles the
-             * caller did not supply are still -1 here and fall back to /dev/null. */
-            set_stdio_fd( stdin_fd, stdout_fd );
 
-            if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
-            if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
-
-            /* Reset signals that we previously set to SIG_IGN */
-            signal( SIGPIPE, SIG_DFL );
-
-            argv = build_argv( &params->CommandLine, 0 );
-            if (unixdir != -1)
-            {
-                fchdir( unixdir );
-                close( unixdir );
-            }
-            execv( unix_name, argv );
+            /* the grandchild exists: it reports its own exec failure, if any, on
+             * its own FD_CLOEXEC copy of the error pipe, so this process has no
+             * further use for any descriptor but the relay */
+            if (pid > 0) relay_child_status( pid, relay[1] );  /* does not return */
+            /* pid == 0: grandchild, exec failed.  pid == -1: this fork failed. */
         }
 
-        if (pid <= 0)  /* grandchild if exec failed or child if fork failed */
+        if (pid <= 0)  /* grandchild if exec failed, or child/relay if a fork failed */
         {
             switch (errno)
             {
@@ -773,6 +864,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         _exit(0); /* child if fork succeeded */
     }
     close( fd[1] );
+    close( relay[1] );
 
     if (pid != -1)
     {
@@ -781,7 +873,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         do {
             wret = waitpid(pid, NULL, 0);
         } while (wret < 0 && errno == EINTR);
-        read( fd[0], &status, sizeof(status) );  /* if we read something, exec or second fork failed */
+        read( fd[0], &status, sizeof(status) );  /* if we read something, exec or a fork failed */
     }
     else status = STATUS_NO_MEMORY;
 
@@ -795,8 +887,32 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         if (!status) start_stdio_pump( stdout_pump );
         else free_stdio_pump( stdout_pump );
     }
+
+    if (!status)
+    {
+        /* the child is running: ask wineserver for a process object over the relay
+         * pipe, so the caller gets a handle it can actually wait on */
+        wine_server_send_fd( relay[0] );
+        SERVER_START_REQ( create_unix_process )
+        {
+            req->relay_fd = relay[0];
+            if (!(status = wine_server_call( req )))
+            {
+                *process_handle = wine_server_ptr_handle( reply->process_handle );
+                *thread_handle  = wine_server_ptr_handle( reply->thread_handle );
+                *process_id     = reply->pid;
+                *thread_id      = reply->tid;
+            }
+        }
+        SERVER_END_REQ;
+        /* if that failed the child is already running and cannot be recalled; but
+         * answering STATUS_SUCCESS with no handle is the exact defect this fixes,
+         * so report the failure rather than hide it */
+    }
+    close( relay[0] );
     return status;
 }
+
 
 static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
 {
@@ -842,7 +958,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     ULONG startup_info_size, env_size;
     int unixdir, socketfd[2] = { -1, -1 };
     struct pe_image_info pe_info;
-    ULONG process_id, thread_id;
+    ULONG process_id = 0, thread_id = 0;
     USHORT machine = 0;
     HANDLE parent = 0, debug = 0, token = 0;
     UNICODE_STRING nt_name, path = {0};
@@ -905,10 +1021,28 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
     if ((status = get_pe_file_info( &attr, &nt_name, &unix_name, &file_handle, &pe_info )))
     {
-        if (status == STATUS_INVALID_IMAGE_NOT_MZ && !fork_and_exec( &attr, unix_name, unixdir, params ))
+        if (status == STATUS_INVALID_IMAGE_NOT_MZ &&
+            !(status = fork_and_exec( &attr, unix_name, unixdir, params, &process_handle,
+                                      &thread_handle, &process_id, &thread_id )))
         {
-            *process_handle_ptr = *thread_handle_ptr = 0;
             memset( info, 0, sizeof(*info) );
+            /* a native unix binary has no PE image information to report, but it
+             * does have a real pid and tid now: those of the process object
+             * wineserver built over the status relay.  NT pids are server ptids,
+             * never the unix pid. */
+            for (i = 0; i < attr_count; i++)
+            {
+                CLIENT_ID id;
+                SIZE_T size;
+
+                if (ps_attr->Attributes[i].Attribute != PS_ATTRIBUTE_CLIENT_ID) continue;
+                id = make_client_id( process_id, thread_id );
+                size = min( ps_attr->Attributes[i].Size, sizeof(id) );
+                memcpy( ps_attr->Attributes[i].ValuePtr, &id, size );
+                if (ps_attr->Attributes[i].ReturnLength) *ps_attr->Attributes[i].ReturnLength = size;
+            }
+            *process_handle_ptr = process_handle;
+            *thread_handle_ptr = thread_handle;
             free( unix_name );
             free( nt_name.Buffer );
             return STATUS_SUCCESS;

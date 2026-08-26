@@ -127,6 +127,19 @@ static void dump_clone_process_reply( const struct clone_process_reply *req )
     fprintf( stderr, ", tid=%04x", req->tid );
 }
 
+static void dump_create_unix_process_request( const struct create_unix_process_request *req )
+{
+    fprintf( stderr, " relay_fd=%d", req->relay_fd );
+}
+
+static void dump_create_unix_process_reply( const struct create_unix_process_reply *req )
+{
+    fprintf( stderr, " pid=%04x", req->pid );
+    fprintf( stderr, ", process_handle=%04x", req->process_handle );
+    fprintf( stderr, ", thread_handle=%04x", req->thread_handle );
+    fprintf( stderr, ", tid=%04x", req->tid );
+}
+
 static void dump_get_startup_info_request( const struct get_startup_info_request *req )
 {
 }
@@ -3572,6 +3585,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_request,
     (dump_func)dump_new_thread_request,
     (dump_func)dump_clone_process_request,
+    (dump_func)dump_create_unix_process_request,
     (dump_func)dump_get_startup_info_request,
     (dump_func)dump_init_process_done_request,
     (dump_func)dump_init_first_thread_request,
@@ -3886,6 +3900,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_new_process_info_reply,
     (dump_func)dump_new_thread_reply,
     (dump_func)dump_clone_process_reply,
+    (dump_func)dump_create_unix_process_reply,
     (dump_func)dump_get_startup_info_reply,
     (dump_func)dump_init_process_done_reply,
     (dump_func)dump_init_first_thread_reply,
@@ -4200,6 +4215,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_new_process_info",
     "new_thread",
     "clone_process",
+    "create_unix_process",
     "get_startup_info",
     "init_process_done",
     "init_first_thread",

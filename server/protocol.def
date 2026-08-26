@@ -1193,6 +1193,39 @@ typedef volatile struct
 @END
 
 
+/* Create a process object standing in for a native (non-PE) unix child.
+ *
+ * The escape path in dlls/ntdll/unix/process.c (get_pe_file_info() answering
+ * STATUS_INVALID_IMAGE_NOT_MZ -> fork_and_exec()) execs a plain unix binary,
+ * which has no wine client and therefore nothing for wineserver to hold on to:
+ * NtCreateUserProcess used to return STATUS_SUCCESS with a null ProcessHandle,
+ * so no caller could ever wait on it or read its exit status.
+ *
+ * The child cannot be waited for directly.  fork_and_exec deliberately orphans
+ * it -- the wine process is its grandparent, not its parent -- so neither wine
+ * nor wineserver may call waitpid(2) on it, and pidfd_open(2) gives exit
+ * notification for a non-child but not the status (waitid(P_PIDFD) on a
+ * non-child answers ECHILD).  So the client leaves a relay process behind that
+ * IS the child's parent; the relay writes the child's unix pid down a pipe,
+ * waitpid()s it, writes the raw wait(2) status, and exits.  This request hands
+ * wineserver the read end of that pipe.
+ *
+ * The process object built over it carries one dummy thread that never runs.
+ * When the status arrives that thread is killed with the translated exit code,
+ * which is what remove_process_thread() copies into process->exit_code and what
+ * signals the process, giving both a working WaitForSingleObject and a working
+ * GetExitCodeProcess.  The relayed unix pid is stored as process->unix_pid, so
+ * NtTerminateProcess reaches the real child too. */
+@REQ(create_unix_process)
+    int          relay_fd;       /* fd of the pipe the relay writes the pid and status to */
+@REPLY
+    process_id_t pid;            /* process id of the new process */
+    obj_handle_t process_handle; /* process handle (in the current process) */
+    obj_handle_t thread_handle;  /* handle to its dummy thread (in the current process) */
+    thread_id_t  tid;            /* thread id of that dummy thread */
+@END
+
+
 /* Retrieve the new process startup info */
 @REQ(get_startup_info)
 @REPLY

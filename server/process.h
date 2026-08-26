@@ -67,6 +67,9 @@ struct process
     unsigned int         is_system:1;     /* is it a system process? */
     unsigned int         debug_children:1;/* also debug all child processes */
     unsigned int         is_terminating:1;/* is process terminating? */
+    unsigned int         unix_relay:1;    /* msg_fd is a status relay pipe, not a client socket */
+    int                  relay_pos;       /* bytes of the relay message received so far */
+    int                  relay_data[2];   /* the child's unix pid, then its raw wait(2) status */
     data_size_t          imagelen;        /* length of image path in bytes */
     WCHAR               *image;           /* main exe image full path */
     struct job          *job;             /* job object associated with this process */

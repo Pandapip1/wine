@@ -11,6 +11,7 @@ DECL_HANDLER(new_process);
 DECL_HANDLER(get_new_process_info);
 DECL_HANDLER(new_thread);
 DECL_HANDLER(clone_process);
+DECL_HANDLER(create_unix_process);
 DECL_HANDLER(get_startup_info);
 DECL_HANDLER(init_process_done);
 DECL_HANDLER(init_first_thread);
@@ -325,6 +326,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_new_process_info,
     (req_handler)req_new_thread,
     (req_handler)req_clone_process,
+    (req_handler)req_create_unix_process,
     (req_handler)req_get_startup_info,
     (req_handler)req_init_process_done,
     (req_handler)req_init_first_thread,
@@ -725,6 +727,13 @@ C_ASSERT( offsetof(struct clone_process_reply, process_handle) == 12 );
 C_ASSERT( offsetof(struct clone_process_reply, thread_handle) == 16 );
 C_ASSERT( offsetof(struct clone_process_reply, tid) == 20 );
 C_ASSERT( sizeof(struct clone_process_reply) == 24 );
+C_ASSERT( offsetof(struct create_unix_process_request, relay_fd) == 12 );
+C_ASSERT( sizeof(struct create_unix_process_request) == 16 );
+C_ASSERT( offsetof(struct create_unix_process_reply, pid) == 8 );
+C_ASSERT( offsetof(struct create_unix_process_reply, process_handle) == 12 );
+C_ASSERT( offsetof(struct create_unix_process_reply, thread_handle) == 16 );
+C_ASSERT( offsetof(struct create_unix_process_reply, tid) == 20 );
+C_ASSERT( sizeof(struct create_unix_process_reply) == 24 );
 C_ASSERT( sizeof(struct get_startup_info_request) == 16 );
 C_ASSERT( offsetof(struct get_startup_info_reply, info_size) == 8 );
 C_ASSERT( offsetof(struct get_startup_info_reply, debugged) == 12 );
