@@ -566,6 +566,126 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 #endif
 
 /***********************************************************************
+ *           stdout pump
+ *
+ * A native unix child cannot inherit a Win32 anonymous pipe.  CreatePipe()
+ * builds an NT named pipe (dlls/kernelbase/sync.c:1455) and both of its ends
+ * are alloc_pseudo_fd() objects (server/named_pipe.c:1384 for the server end,
+ * :1407 for the client end) -- a pseudo fd has no underlying unix descriptor,
+ * the data moves through wineserver message queues.  So
+ * wine_server_handle_to_fd() has nothing to hand to the child and the handle
+ * silently degrades to /dev/null.
+ *
+ * Hand the child a real unix pipe instead and copy the bytes into the NT
+ * handle from a helper thread.
+ */
+
+struct stdio_pump
+{
+    int    fd;      /* read end of the unix pipe given to the child */
+    HANDLE handle;  /* our own reference on the caller's std handle */
+};
+
+static void free_stdio_pump( struct stdio_pump *pump )
+{
+    close( pump->fd );
+    NtClose( pump->handle );
+    free( pump );
+}
+
+static void stdio_pump_proc( void *arg )
+{
+    struct stdio_pump *pump = arg;
+    IO_STATUS_BLOCK io;
+    HANDLE event = NULL;
+    char buffer[4096];
+
+    NtCreateEvent( &event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE );
+
+    for (;;)
+    {
+        ssize_t pos = 0, len = read( pump->fd, buffer, sizeof(buffer) );
+
+        if (len < 0 && errno == EINTR) continue;
+        if (len <= 0) break;  /* child closed its stdout, or the read failed */
+
+        while (pos < len)
+        {
+            NTSTATUS status = NtWriteFile( pump->handle, event, NULL, NULL, &io,
+                                           buffer + pos, len - pos, NULL, NULL );
+            if (status == STATUS_PENDING)
+            {
+                NtWaitForSingleObject( event, FALSE, NULL );
+                status = io.Status;
+            }
+            if (status || !io.Information) goto done;
+            pos += io.Information;
+        }
+    }
+
+done:
+    if (event) NtClose( event );
+    free_stdio_pump( pump );
+}
+
+/* Build a unix pipe standing in for a std handle that has no unix fd of its
+ * own.  Returns the write end, to be handed to the child, or -1. */
+static int alloc_stdio_pump( HANDLE handle, struct stdio_pump **pump )
+{
+    int fd[2];
+    HANDLE dup;
+
+    *pump = NULL;
+    if (!handle) return -1;
+    /* keep the handle alive past the caller closing its own copy; closing this
+     * reference is also what gives the reader its EOF */
+    if (NtDuplicateObject( NtCurrentProcess(), handle, NtCurrentProcess(), &dup,
+                           0, 0, DUPLICATE_SAME_ACCESS ))
+        return -1;
+
+#ifdef HAVE_PIPE2
+    if (pipe2( fd, O_CLOEXEC ) == -1)
+#endif
+    {
+        if (pipe( fd ) == -1)
+        {
+            NtClose( dup );
+            return -1;
+        }
+        fcntl( fd[0], F_SETFD, FD_CLOEXEC );
+        fcntl( fd[1], F_SETFD, FD_CLOEXEC );
+    }
+
+    if (!(*pump = malloc( sizeof(**pump) )))
+    {
+        close( fd[0] );
+        close( fd[1] );
+        NtClose( dup );
+        return -1;
+    }
+    (*pump)->fd = fd[0];
+    (*pump)->handle = dup;
+    return fd[1];
+}
+
+static void start_stdio_pump( struct stdio_pump *pump )
+{
+    HANDLE thread;
+
+    /* PsCreateSystemThread gives us a thread that is registered with the
+     * server, so it may make server calls (NtWriteFile); a bare pthread has no
+     * thread_data and could not. */
+    if (PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, stdio_pump_proc, pump ))
+    {
+        ERR( "failed to start the stdout pump thread\n" );
+        free_stdio_pump( pump );
+        return;
+    }
+    NtClose( thread );
+}
+
+
+/***********************************************************************
  *           fork_and_exec
  *
  * Fork and exec a new Unix binary, checking for errors.
@@ -575,6 +695,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 {
     pid_t pid;
     int fd[2], stdin_fd = -1, stdout_fd = -1;
+    struct stdio_pump *stdout_pump = NULL;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
 
@@ -595,11 +716,16 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         isatty(1) && is_unix_console_handle( params->hStdOutput ))
         stdout_fd = 1;
 
+    /* a pipe end has no unix fd of its own, so nothing was resolved above even
+     * though the caller did supply a handle; pump the bytes across instead */
+    if (stdout_fd == -1) stdout_fd = alloc_stdio_pump( params->hStdOutput, &stdout_pump );
+
     if (!(pid = fork()))  /* child */
     {
         if (!(pid = fork()))  /* grandchild */
         {
             close( fd[0] );
+            if (stdout_pump) close( stdout_pump->fd );
 
             if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                 params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
@@ -662,6 +788,13 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     close( fd[0] );
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
+    /* the write end is closed above, so the pump sees EOF once the child and
+     * everything it forked are gone */
+    if (stdout_pump)
+    {
+        if (!status) start_stdio_pump( stdout_pump );
+        else free_stdio_pump( stdout_pump );
+    }
     return status;
 }
 
