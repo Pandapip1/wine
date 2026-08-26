@@ -570,7 +570,7 @@ NTSTATUS wow64_wine_spawnvp( void *args )
 #endif
 
 /***********************************************************************
- *           stdout pump
+ *           std handle pumps
  *
  * A native unix child cannot inherit a Win32 anonymous pipe.  CreatePipe()
  * builds an NT named pipe (dlls/kernelbase/sync.c:1455) and both of its ends
@@ -580,20 +580,22 @@ NTSTATUS wow64_wine_spawnvp( void *args )
  * wine_server_handle_to_fd() has nothing to hand to the child and the handle
  * silently degrades to /dev/null.
  *
- * Hand the child a real unix pipe instead and copy the bytes into the NT
- * handle from a helper thread.
+ * Hand the child a real unix pipe instead and copy the bytes between it and
+ * the NT handle from a helper thread.
  */
 
 struct stdio_pump
 {
-    int    fd;      /* read end of the unix pipe given to the child */
+    int    fd;      /* our end of the unix pipe whose other end the child got */
     HANDLE handle;  /* our own reference on the caller's std handle */
+    HANDLE process; /* stdin pump only: the child, so its exit can end the pump */
 };
 
 static void free_stdio_pump( struct stdio_pump *pump )
 {
     close( pump->fd );
     NtClose( pump->handle );
+    if (pump->process) NtClose( pump->process );
     free( pump );
 }
 
@@ -633,8 +635,9 @@ done:
 }
 
 /* Build a unix pipe standing in for a std handle that has no unix fd of its
- * own.  Returns the write end, to be handed to the child, or -1. */
-static int alloc_stdio_pump( HANDLE handle, struct stdio_pump **pump )
+ * own.  Returns the end to be handed to the child -- the write end for an
+ * output handle, the read end for stdin -- or -1. */
+static int alloc_stdio_pump( HANDLE handle, struct stdio_pump **pump, BOOL from_child )
 {
     int fd[2];
     HANDLE dup;
@@ -667,9 +670,10 @@ static int alloc_stdio_pump( HANDLE handle, struct stdio_pump **pump )
         NtClose( dup );
         return -1;
     }
-    (*pump)->fd = fd[0];
+    (*pump)->fd = fd[from_child ? 0 : 1];
     (*pump)->handle = dup;
-    return fd[1];
+    (*pump)->process = 0;
+    return fd[from_child ? 1 : 0];
 }
 
 static void start_stdio_pump( struct stdio_pump *pump )
@@ -682,6 +686,144 @@ static void start_stdio_pump( struct stdio_pump *pump )
     if (PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, stdio_pump_proc, pump ))
     {
         ERR( "failed to start the stdout pump thread\n" );
+        free_stdio_pump( pump );
+        return;
+    }
+    NtClose( thread );
+}
+
+/* How many bytes are waiting on an NT pipe end, without consuming them.
+ * FSCTL_PIPE_PEEK never blocks -- server/named_pipe.c:1256 answers it inline
+ * from pipe_end_peek() (:1119) and queues no async -- and it reports
+ * STATUS_PIPE_BROKEN once the writer is gone and the queue has been drained,
+ * which is exactly the pump's EOF.  It fails on anything that is not a pipe
+ * end, which is how alloc_stdin_pump() decides whether a pump is safe. */
+static NTSTATUS pipe_peek_avail( HANDLE handle, ULONG *avail )
+{
+    FILE_PIPE_PEEK_BUFFER buffer;
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+
+    memset( &buffer, 0, sizeof(buffer) );
+    status = NtFsControlFile( handle, NULL, NULL, NULL, &io, FSCTL_PIPE_PEEK,
+                              NULL, 0, &buffer, sizeof(buffer) );
+    if (status == STATUS_BUFFER_OVERFLOW) status = STATUS_SUCCESS;  /* message mode */
+    if (!status) *avail = buffer.ReadDataAvailable;
+    return status;
+}
+
+/*
+ * The stdin pump is the mirror image of the stdout one, and the whole of its
+ * difficulty is teardown: it must never be left blocked on a handle nothing
+ * will ever write to again.  Three things can end it, and every one of them is
+ * observable here:
+ *
+ *  - EOF on the caller's handle.  FSCTL_PIPE_PEEK turns to STATUS_PIPE_BROKEN
+ *    as soon as the last writer is gone and the queue is empty.
+ *  - The child closing its stdin, or dying.  write() then fails with EPIPE;
+ *    SIGPIPE is SIG_IGN process-wide (dlls/ntdll/unix/server.c:1671) so that
+ *    is an error return and not a killed process.
+ *  - The child exiting while the caller still holds the write end and never
+ *    writes again.  Neither of the first two ever fires then, so the pump must
+ *    watch the child itself -- which is possible only since d63f8d41e gave
+ *    this path a real process object.
+ *
+ * That last one is why the loop peeks rather than simply blocking in
+ * NtReadFile.  A read on the caller's handle cannot be interrupted: CreatePipe
+ * makes both ends FILE_SYNCHRONOUS_IO_NONALERT (dlls/kernelbase/sync.c:1486),
+ * so server_read_file() hands back the server's own wait handle and blocks in
+ * wait_async() on it (dlls/ntdll/unix/file.c:6193) -- not alertable, and not
+ * an object this thread could add the process to.  So the pump only ever
+ * enters NtReadFile once a peek has said there are bytes waiting, and does its
+ * only waiting on the process handle, with a timeout to peek again.  Every
+ * wait in the loop is therefore bounded, whatever the child and the caller do.
+ */
+static void stdin_pump_proc( void *arg )
+{
+    struct stdio_pump *pump = arg;
+    unsigned int idle = 0;
+    IO_STATUS_BLOCK io;
+    HANDLE event = NULL;
+    char buffer[4096];
+
+    NtCreateEvent( &event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE );
+
+    for (;;)
+    {
+        LARGE_INTEGER timeout;
+        NTSTATUS status;
+        ULONG avail = 0;
+        ULONG pos;
+
+        if (pipe_peek_avail( pump->handle, &avail )) break;  /* the writer is gone */
+
+        if (!avail)
+        {
+            /* the only point at which the pump idles, so the only point that
+             * needs a wakeup; poll briefly at first so an interactive child
+             * stays responsive, then back off */
+            timeout.QuadPart = -10000 * (LONGLONG)(idle < 20 ? 10 : 100);
+            if (NtWaitForSingleObject( pump->process, FALSE, &timeout ) != STATUS_TIMEOUT) break;
+            idle++;
+            continue;
+        }
+        idle = 0;
+
+        status = NtReadFile( pump->handle, event, NULL, NULL, &io, buffer,
+                             min( avail, sizeof(buffer) ), NULL, NULL );
+        if (status == STATUS_PENDING)
+        {
+            NtWaitForSingleObject( event, FALSE, NULL );
+            status = io.Status;
+        }
+        if (status || !io.Information) break;
+
+        for (pos = 0; pos < io.Information; )
+        {
+            ssize_t written = write( pump->fd, buffer + pos, io.Information - pos );
+
+            if (written > 0) pos += written;
+            else if (written < 0 && errno == EINTR) continue;
+            else goto done;  /* EPIPE: the child closed its stdin, or is gone */
+        }
+    }
+
+done:
+    if (event) NtClose( event );
+    free_stdio_pump( pump );
+}
+
+/* Only a pipe end can be pumped into.  The pump has to be able to tell "no
+ * data yet" from "the writer is gone" without ever blocking, and
+ * FSCTL_PIPE_PEEK is the only thing that does that; on a handle that does not
+ * answer it there is no safe pump, so leave stdin alone and let the existing
+ * /dev/null fallback stand.  A pump that could block forever would be worse
+ * than /dev/null, which at least gives the child a prompt EOF. */
+static int alloc_stdin_pump( HANDLE handle, struct stdio_pump **pump )
+{
+    ULONG avail;
+
+    *pump = NULL;
+    if (!handle || pipe_peek_avail( handle, &avail )) return -1;
+    return alloc_stdio_pump( handle, pump, FALSE );
+}
+
+static void start_stdin_pump( struct stdio_pump *pump, HANDLE process )
+{
+    HANDLE thread;
+
+    /* our own reference: the handle is the caller's and it may close it at any
+     * time, but the pump needs to watch the child for as long as it runs */
+    if (NtDuplicateObject( NtCurrentProcess(), process, NtCurrentProcess(), &pump->process,
+                           SYNCHRONIZE, 0, 0 ))
+    {
+        ERR( "failed to duplicate the process handle for the stdin pump\n" );
+        free_stdio_pump( pump );
+        return;
+    }
+    if (PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, stdin_pump_proc, pump ))
+    {
+        ERR( "failed to start the stdin pump thread\n" );
         free_stdio_pump( pump );
         return;
     }
@@ -826,7 +968,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 {
     pid_t pid;
     int fd[2], relay[2], stdin_fd = -1, stdout_fd = -1;
-    struct stdio_pump *stdout_pump = NULL;
+    struct stdio_pump *stdin_pump = NULL, *stdout_pump = NULL;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
 
@@ -866,7 +1008,10 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
 
     /* a pipe end has no unix fd of its own, so nothing was resolved above even
      * though the caller did supply a handle; pump the bytes across instead */
-    if (stdout_fd == -1) stdout_fd = alloc_stdio_pump( params->hStdOutput, &stdout_pump );
+    if (stdout_fd == -1) stdout_fd = alloc_stdio_pump( params->hStdOutput, &stdout_pump, TRUE );
+    /* and the same for stdin, in the other direction; alloc_stdin_pump()
+     * refuses any handle whose EOF it could not observe without blocking */
+    if (stdin_fd == -1) stdin_fd = alloc_stdin_pump( params->hStdInput, &stdin_pump );
 
     /* Three forks, not two: the caller's own child (C) must exit immediately so
      * that the waitpid() below returns at once and leaves no zombie, and the
@@ -884,6 +1029,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
             {
                 close( fd[0] );
                 close( relay[1] );
+                if (stdin_pump) close( stdin_pump->fd );
                 if (stdout_pump) close( stdout_pump->fd );
 
                 if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
@@ -965,6 +1111,14 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         (status = create_unix_process_object( relay[0], process_handle, thread_handle,
                                               process_id, thread_id )))
         ERR( "failed to create a process object for %s, status %#x\n", debugstr_a(unix_name), status );
+
+    /* armed last of all: the stdin pump ends itself when the child exits, and
+     * the object it needs for that only exists once the call above succeeded */
+    if (stdin_pump)
+    {
+        if (!status) start_stdin_pump( stdin_pump, *process_handle );
+        else free_stdio_pump( stdin_pump );
+    }
 
     close( relay[0] );
     return status;
