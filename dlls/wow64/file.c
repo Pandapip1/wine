@@ -834,7 +834,23 @@ NTSTATUS WINAPI wow64_NtSetInformationFile( UINT *args )
             name.Length = info32->FileNameLength;
             InitializeObjectAttributes( &attr, &name, 0, LongToHandle( info32->RootDirectory ), 0 );
             get_file_redirect( &attr );
+            /* NtSetInformationFile's 64-bit FileRenameInformation[Ex] handler
+             * (dlls/ntdll/unix/file.c) rejects the call with
+             * STATUS_INVALID_PARAMETER_3 unless len >= sizeof(FILE_RENAME_INFORMATION),
+             * not just >= the FileName-relative offset this thunk used to pass. A
+             * short FileName lands offsetof(...,FileName[N]) below that padded
+             * struct size -- e.g. any name under 4 WCHARs, since
+             * offsetof(FileName)==24 and sizeof(FILE_RENAME_INFORMATION)==32 on
+             * 64-bit -- so a rename/link to e.g. a one-character name was bounced
+             * even though every byte the request actually needs (Flags/
+             * RootDirectory/FileNameLength plus FileNameLength bytes of name) was
+             * present and correct; the unix side trusts FileNameLength, not len,
+             * to bound how much of FileName it reads. Real Windows accepts a
+             * WoW64 rename to a one-character name via a directory-relative
+             * RootDirectory, so clamp up to the struct's natural (padded) size to
+             * match -- this only widens what is accepted. */
             size = offsetof( FILE_RENAME_INFORMATION, FileName[name.Length/sizeof(WCHAR)] );
+            if (size < sizeof(FILE_RENAME_INFORMATION)) size = sizeof(FILE_RENAME_INFORMATION);
             info = Wow64AllocateTemp( size );
             info->Flags           = info32->Flags;
             info->RootDirectory   = attr.RootDirectory;
