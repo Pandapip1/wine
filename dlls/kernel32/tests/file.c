@@ -60,6 +60,7 @@ static void (WINAPI *pRtlInitAnsiString)(PANSI_STRING,PCSZ);
 static void (WINAPI *pRtlFreeUnicodeString)(PUNICODE_STRING);
 static BOOL (WINAPI *pSetFileCompletionNotificationModes)(HANDLE, UCHAR);
 static HANDLE (WINAPI *pFindFirstStreamW)(LPCWSTR filename, STREAM_INFO_LEVELS infolevel, void *data, DWORD flags);
+static BOOL (WINAPI *pFindNextStreamW)(HANDLE handle, void *data);
 
 static char filename[MAX_PATH];
 static const char sillytext[] =
@@ -110,6 +111,7 @@ static void InitFunctionPointers(void)
     pReOpenFile = (void *) GetProcAddress(hkernel32, "ReOpenFile");
     pSetFileCompletionNotificationModes = (void *)GetProcAddress(hkernel32, "SetFileCompletionNotificationModes");
     pFindFirstStreamW = (void *)GetProcAddress(hkernel32, "FindFirstStreamW");
+    pFindNextStreamW = (void *)GetProcAddress(hkernel32, "FindNextStreamW");
 }
 
 static void create_file( const char *path )
@@ -6343,7 +6345,13 @@ static void test_file_readonly_access(void)
 static void test_find_file_stream(void)
 {
     WCHAR path[] = {'C',':','\\','w','i','n','d','o','w','s',0};
-    HANDLE handle;
+    static const WCHAR suffix[] = {':','w','i','n','e','t','e','s','t',0};
+    static const char stream_contents[] = "stream contents";
+    WCHAR temp_path[MAX_PATH], file_path[MAX_PATH], stream_path[MAX_PATH + ARRAY_SIZE(suffix)];
+    BOOL found_default = FALSE, found_named = FALSE;
+    HANDLE handle, file;
+    DWORD written, read;
+    char buffer[sizeof(stream_contents)];
     int error;
     WIN32_FIND_STREAM_DATA data;
 
@@ -6358,6 +6366,68 @@ static void test_find_file_stream(void)
     error = GetLastError();
     ok(handle == INVALID_HANDLE_VALUE, "Expected INVALID_HANDLE_VALUE, got %p\n", handle);
     ok(error == ERROR_HANDLE_EOF, "Expected ERROR_HANDLE_EOF, got %d\n", error);
+
+    if (!pFindNextStreamW)
+    {
+        win_skip("FindNextStreamW is missing\n");
+        return;
+    }
+
+    GetTempPathW( ARRAY_SIZE(temp_path), temp_path );
+    GetTempFileNameW( temp_path, L"str", 0, file_path );
+    lstrcpyW( stream_path, file_path );
+    lstrcatW( stream_path, suffix );
+
+    file = CreateFileW( stream_path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, CREATE_NEW, 0, NULL );
+    ok(file != INVALID_HANDLE_VALUE, "failed to create stream, error %lu\n", GetLastError());
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        ok(WriteFile( file, stream_contents, sizeof(stream_contents), &written, NULL ),
+           "failed to write stream, error %lu\n", GetLastError());
+        ok(written == sizeof(stream_contents), "wrote %lu bytes\n", written);
+        CloseHandle( file );
+    }
+
+    file = CreateFileW( stream_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, 0, NULL );
+    ok(file != INVALID_HANDLE_VALUE, "failed to reopen stream, error %lu\n", GetLastError());
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        memset( buffer, 0, sizeof(buffer) );
+        ok(ReadFile( file, buffer, sizeof(buffer), &read, NULL ),
+           "failed to read stream, error %lu\n", GetLastError());
+        ok(read == sizeof(stream_contents), "read %lu bytes\n", read);
+        ok(!memcmp( buffer, stream_contents, sizeof(stream_contents) ), "unexpected stream contents\n");
+        CloseHandle( file );
+    }
+
+    handle = pFindFirstStreamW( file_path, FindStreamInfoStandard, &data, 0 );
+    ok(handle != INVALID_HANDLE_VALUE, "failed to enumerate streams, error %lu\n", GetLastError());
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (!lstrcmpW( data.cStreamName, L"::$DATA" )) found_default = TRUE;
+            if (!lstrcmpW( data.cStreamName, L":winetest:$DATA" ))
+            {
+                found_named = TRUE;
+                ok(data.StreamSize.QuadPart == sizeof(stream_contents),
+                   "unexpected stream size %s\n", wine_dbgstr_longlong(data.StreamSize.QuadPart));
+            }
+        } while (pFindNextStreamW( handle, &data ));
+        ok(GetLastError() == ERROR_HANDLE_EOF, "expected ERROR_HANDLE_EOF, got %lu\n", GetLastError());
+        ok(found_default, "default stream was not enumerated\n");
+        ok(found_named, "named stream was not enumerated\n");
+        FindClose( handle );
+    }
+
+    ok(DeleteFileW( stream_path ), "failed to delete stream, error %lu\n", GetLastError());
+    file = CreateFileW( stream_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, 0, NULL );
+    ok(file == INVALID_HANDLE_VALUE, "deleted stream still exists\n");
+    if (file != INVALID_HANDLE_VALUE) CloseHandle( file );
+    ok(DeleteFileW( file_path ), "failed to delete base file, error %lu\n", GetLastError());
 }
 
 static void test_SetFileTime(void)

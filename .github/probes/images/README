@@ -1,12 +1,43 @@
 Test images for .github/probes/pe-alignment-status.ps1
 =====================================================
 
-Four prebuilt PE32 executables used to ask one question of a real NT kernel:
+Eight prebuilt PE executables used to ask one question of a real NT kernel:
 does it load a PE whose SectionAlignment is smaller than the page size?
+
+They come in two sets of four that differ on the MACHINE AXIS ALONE:
+
+    i386 set    Machine 0x014c / Magic 0x010b (PE32).   On an x64 runner these
+                reach the loader through WOW64.
+    x86-64 set  Machine 0x8664 / Magic 0x020b (PE32+).  These reach the native
+                64-bit loader; no WOW64 is involved.
+
+Both sets were built from the same source by the same tcc build with the same
+flags, so a difference between them is attributable to the machine type.
 
 They are committed as binaries deliberately.  They are NOT generated at probe
 time: a generated image would measure this repo's generator, and the point of
 the probe is to measure NT.
+
+Each set carries its own positive control (default.exe / default-x64.exe) and
+the probe runs each control FIRST within its half.  The controls are not
+interchangeable: a 32-bit control passing shows only that the harness reaches
+the WOW64 loader, which says nothing about whether it reaches the 64-bit one.
+
+
+Evidence status -- read this before quoting anything below
+----------------------------------------------------------
+This file separates three different grades of claim.  Do not flatten them.
+
+  [VERIFIED HERE]   Checked on the machine that assembled this directory, by
+                    two independent parsers that agree.
+  [SUPPLIED]        Stated by the author of the images.  Carries a name, not
+                    evidence.  Reproducible by someone with the toolchain; it
+                    was not reproducible here, for the reason given below.
+  [MEASURED ON CI]  An observation from a named CI run against real NT.
+
+The sha256 sums are the identity of these files.  Everything else about their
+origin is provenance; if a sum ever disagrees, the provenance is void.
+
 
 Source
 ------
@@ -16,56 +47,180 @@ hi.c (committed alongside, 51 bytes):
     int main(void) { return 42; }
 
 sha256 of hi.c: 2f61c6ada042773cdd7ac63a41a3c3c5cdbba5346300c9b08bb0d1638fd7c0da
+    [VERIFIED HERE]
 
-Producing toolchain
--------------------
-Reported by the author of the images: tcc (the Tiny C Compiler), targeting
-win32/i386.
 
-This is REPORTED, not measured.  The binaries carry no embedded toolchain
-string (searched: no "tcc" substring anywhere in any of the four files), and
-they could not be reproduced on the machine that assembled this directory --
-its tcc is 0.9.27 (x86_64 Linux) with no win32 headers or crt, so it cannot
-emit a PE at all.  The exact tcc version and the exact link flags that set the
-sub-page alignments are therefore NOT established here.  The sha256 sums below
-are the identity of these files; the toolchain attribution is hearsay.
+Producing toolchain  [SUPPLIED]
+-------------------------------
+tcc (the Tiny C Compiler), build ID 19d68402, reporting itself as:
 
-What IS measured from the bytes (by python3 struct, on the files as copied):
+    tcc version 0.9.28rc 2026-08-25 mob@19d68402
 
-    file             size   Machine  Magic   SectAlign  FileAlign  SizeOfImage  Subsystem
-    default.exe      2048   0x014c   0x010b  0x1000     0x200      0x4000       3
-    subpage20.exe    1568   0x014c   0x010b  0x0020     0x0020     0x0460       3
-    subpage200.exe   2048   0x014c   0x010b  0x0200     0x0200     0x0a00       3
-    native20.exe     1568   0x014c   0x010b  0x0020     0x0020     0x0460       1
+Repository: github.com/Pandapip1/tinycc
 
-    All four: e_lfanew=0x80, "PE\0\0", 3 sections (.text/.rdata/.bss),
-    SizeOfOptionalHeader=0xe0, LinkerVersion 6.0, TimeDateStamp=0,
+IDENTICAL for both the i386 and the x86-64 set.  That is the reason the two
+sets are comparable at all: same compiler build, same source, same flags, one
+axis changed.
+
+    i386 set:    T=.../i386-win32-tcc
+    x86-64 set:  T=.../x86_64-win32-tcc
+    both:        P=.../install/lib/tcc/win32
+
+    invoked as:  $T -B$P -I$P/include -L$P/lib hi.c -o <out>   plus per-cell:
+
+        default     / default-x64      (no extra flags)
+        subpage20   / subpage20-x64    -Wl,--section-alignment=20 -Wl,--file-alignment=20
+        subpage200  / subpage200-x64   -Wl,--section-alignment=200 -Wl,--file-alignment=200
+        native20    / native20-x64     -Wl,--section-alignment=20 -Wl,--file-alignment=20
+                                        -Wl,-subsystem=native
+
+THE ALIGNMENT VALUES ABOVE ARE PARSED AS HEXADECIMAL, NOT DECIMAL.  `=20' means
+0x20 and `=200' means 0x200.  Anyone "correcting" them to decimal builds
+DIFFERENT IMAGES and the sha256 sums below will not reproduce.
+
+    [VERIFIED HERE] -- read from the toolchain's own source at the stated build
+    ID, not taken on trust.  In libtcc.c at commit 19d68402:
+
+        1497:  } else if (link_option(&o, "section-alignment=")) {
+        1498:      s->section_align = strtoul(o.arg, &end, 16);
+        ...
+        1518:  } else if (link_option(&o, "file-alignment=")) {
+        1519:      s->pe_file_align = strtoul(o.arg, &end, 16);
+
+    Base 16 in both cases.  The trap is real rather than theoretical because
+    the neighbouring option is NOT hex -- `--stack=' three lines further down
+    uses strtoul(..., 10) -- so there is no consistent rule to fall back on and
+    the flags must be read literally.
+
+Why this section is [SUPPLIED] and not [VERIFIED HERE]
+------------------------------------------------------
+The images could not be rebuilt on the machine that assembled this directory.
+Its tcc is 0.9.27, x86_64 Linux, with no win32 headers and no win32 crt, so it
+cannot emit a PE at all -- for either machine type.  The gap is ENVIRONMENTAL,
+not an oversight: nothing here contradicts the attribution, it simply could not
+be exercised.  A reader with an x86_64-win32-tcc and an i386-win32-tcc at build
+19d68402 can close it by rebuilding and comparing sums.
+
+Caveat for anyone who does reproduce this  [SUPPLIED]
+-----------------------------------------------------
+Rebuilding with a CURRENT tcc is expected to yield BYTE-IDENTICAL images but a
+DIFFERENT stderr warning, because build 19d68402 still carries the older
+warning text.  A differing warning line is therefore not evidence that the
+images differ -- compare the sha256 sums, not the compiler's chatter.
+
+Related, and worth stating plainly: at 19d68402 the sub-page warning tcc emits
+reads "section alignment 0x%x is below the page size; modern Windows will not
+load this image" (tccpe.c:890, and gated at :887 on the user having asked for
+the alignment).  THAT STRING IS THE TOOLCHAIN'S BELIEF ABOUT NT, NOT A
+MEASUREMENT OF NT.  It must not be read as a prior for any cell in this probe;
+measuring that belief is the entire reason the probe exists.
+
+
+sha256  [VERIFIED HERE]
+-----------------------
+i386 / PE32:
+
+    b3b4817f4b8bf0688af96a2652f026ad71c19ed8d2ac82df38263f710d67ad0f  default.exe
+    75c10877d50bba918d3751701ef07457b789e1743433807aaf9eb18c438a9b5a  subpage200.exe
+    489368b986ca21ae98486a2a7989a5e1fc756a17c6b80fb34b90401d5122b863  subpage20.exe
+    a3f7b535e1bfc753d920478035eddc130c25fc1361321d5b6722a8e528cf1b2c  native20.exe
+
+x86-64 / PE32+:
+
+    d0522b6ff583cad0cca00dddfe44468dab8070cf6ccfe4983d862ac424932eab  default-x64.exe
+    5679901ccf4ec0f73ab5a865c73aa8ec4f3db823991599d7e5b6c73564fa2888  subpage200-x64.exe
+    2eda85779dd62afa981ef2966cf852257f2afabbf95b2234852f95bd328b5df7  subpage20-x64.exe
+    3d791d9a5630587c8898902dfc62d0f12da13db3c6408a4d353451901c0995ef  native20-x64.exe
+
+These sums are the identity of these files.  The probe recomputes them at run
+time on the runner and prints measured against expected, so a mangled checkout
+shows up as a hash mismatch rather than as a mysterious NTSTATUS.
+.gitattributes here marks *.exe binary so no eol conversion can touch them.
+
+
+Headers, read from the bytes  [VERIFIED HERE]
+---------------------------------------------
+Parsed twice, independently, and the two agree field for field: once by
+python3 struct, and once by the probe's own ShowHeaders function, extracted
+verbatim from pe-alignment-status.ps1 by the PowerShell AST parser and run
+under Linux pwsh against these committed files.  Cross-checking the probe's
+parser against a second implementation is the part of the probe that IS
+testable off-Windows, so it was tested.
+
+    file                 size  Machine  Magic   nsec  SzOptHdr  SectAlign  FileAlign  SizeOfImage  Subsys
+    default.exe          2048  0x014c   0x010b     3     0xe0     0x1000     0x0200      0x4000      3
+    subpage200.exe       2048  0x014c   0x010b     3     0xe0     0x0200     0x0200      0x0a00      3
+    subpage20.exe        1568  0x014c   0x010b     3     0xe0     0x0020     0x0020      0x0460      3
+    native20.exe         1568  0x014c   0x010b     3     0xe0     0x0020     0x0020      0x0460      1
+    default-x64.exe      3072  0x8664   0x020b     4     0xf0     0x1000     0x0200      0x5000      3
+    subpage200-x64.exe   3072  0x8664   0x020b     4     0xf0     0x0200     0x0200      0x0c00      3
+    subpage20-x64.exe    2112  0x8664   0x020b     4     0xf0     0x0020     0x0020      0x0640      3
+    native20-x64.exe     2112  0x8664   0x020b     4     0xf0     0x0020     0x0020      0x0640      1
+
+    All eight: e_magic=0x5a4d, e_lfanew=0x80, "PE\0\0", TimeDateStamp=0,
     imports from kernel32.dll and msvcrt.dll.
+    i386 set:   3 sections (.text/.rdata/.bss),        Characteristics 0x030f.
+    x86-64 set: 4 sections (.text/.rdata/.bss/.pdata), Characteristics 0x022f.
+    The extra .pdata and the larger optional header are what PE32+ requires;
+    they are not an alignment difference.
 
-    Machine 0x014c is i386 and Magic 0x010b is PE32.  All four cells share
-    that, so it is constant along the alignment axis -- but note that on an
-    x64 CI runner every CreateProcessW here goes through WOW64.
+The probe re-parses all of this on the runner and additionally cross-checks the
+Machine and Magic it reads against the values recorded in this table.  A
+disagreement is printed as a HEADER DISAGREEMENT finding about the committed
+file; it is not silently reconciled.
 
-sha256
-------
-489368b986ca21ae98486a2a7989a5e1fc756a17c6b80fb34b90401d5122b863  subpage20.exe
-75c10877d50bba918d3751701ef07457b789e1743433807aaf9eb18c438a9b5a  subpage200.exe
-a3f7b535e1bfc753d920478035eddc130c25fc1361321d5b6722a8e528cf1b2c  native20.exe
-b3b4817f4b8bf0688af96a2652f026ad71c19ed8d2ac82df38263f710d67ad0f  default.exe
 
-The probe recomputes these at run time on the runner and prints measured
-against expected, so a mangled checkout shows up as a hash mismatch rather
-than as a mysterious NTSTATUS.  .gitattributes here marks *.exe binary so no
-eol conversion can touch them.
+Result on the i386 set  [MEASURED ON CI]
+-----------------------------------------
+Windows Server 2025 runner, GitHub Actions run 32926175575.  This is recorded
+so the artifact carries its own result.
+
+    default.exe     0x1000/0x200  CreateProcessW=True   SEC_IMAGE=0x00000000   (control: PASS)
+    subpage200.exe  0x200/0x200   CreateProcessW=False err=193  SEC_IMAGE=0xC000007B
+    subpage20.exe   0x20/0x20     CreateProcessW=False err=193  SEC_IMAGE=0xC000007B
+    native20.exe    0x20/0x20 s1  CreateProcessW=False err=193  SEC_IMAGE=0xC000007B
+
+    0xC000007B is STATUS_INVALID_IMAGE_FORMAT; 193 is ERROR_BAD_EXE_FORMAT.
+
+    SEC_COMMIT returned 0x00000000 on every rejected image.  That is the
+    control on the axis: the file object backs a section perfectly well, so
+    what was rejected is specifically the IMAGE FORMAT, not the file.
+
+    The positive control passed, so the harness was working and these are
+    measurements of the kernel rather than of the probe.
+
+    Scope of this result, stated exactly: on this kernel, sub-page
+    SectionAlignment PE32 images were rejected via the WOW64 path -- INCLUDING
+    the 0x200/0x200 case.  Every image in that set is Machine 0x014c, so this
+    is an answer about the WOW64 loader and about nothing else.  The x86-64 set
+    exists precisely because this result does not generalise across the machine
+    axis on its own.
+
+    NO RESULT IS RECORDED OR PREDICTED HERE FOR THE x86-64 SET.  It has not
+    been run.  Do not write an expected NTSTATUS for those cells into this file
+    or into the probe: the whole value of the x64 half is that its outcome is
+    not assumed in advance, and an expectation recorded here would contaminate
+    the reading of whatever comes back.
+
 
 Roles
 -----
-default.exe      positive control.  Ordinary 0x1000/0x200 alignment.  If this
-                 does not map as SEC_IMAGE and launch, the harness is broken
-                 and the whole run is void.
-subpage200.exe   SectionAlignment == FileAlignment == 0x200.  This is the cell
-                 the probe exists for.
-subpage20.exe    SectionAlignment == FileAlignment == 0x20.
-native20.exe     Subsystem 1 (native).  Only meaningful on the
-                 NtCreateSection(SEC_IMAGE) axis; its CreateProcessW result
-                 says nothing about alignment.
+default.exe        i386 positive control.  Ordinary 0x1000/0x200 alignment.  If
+                   this does not map as SEC_IMAGE and launch, the i386 half is
+                   broken and every i386 cell is void.
+subpage200.exe     SectionAlignment == FileAlignment == 0x200.  The cell the
+                   probe exists for.
+subpage20.exe      SectionAlignment == FileAlignment == 0x20.
+native20.exe       Subsystem 1 (native).  Only meaningful on the
+                   NtCreateSection(SEC_IMAGE) axis; CreateProcessW does not
+                   create user-mode processes from native-subsystem images, so
+                   its CreateProcessW result says nothing about alignment.
+
+default-x64.exe    x86-64 positive control, run first among the x64 cells.  If
+                   this does not map as SEC_IMAGE and launch, the harness never
+                   reached the native 64-bit loader and every x64 cell is void.
+                   The i386 control does NOT stand in for this one.
+subpage200-x64.exe SectionAlignment == FileAlignment == 0x200, PE32+.
+subpage20-x64.exe  SectionAlignment == FileAlignment == 0x20, PE32+.
+native20-x64.exe   Subsystem 1 (native), PE32+.  Same caveat as native20.exe:
+                   only the SEC_IMAGE line is on-axis.

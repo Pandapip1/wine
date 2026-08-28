@@ -2090,6 +2090,284 @@ static void test_file_set_zero_data(void)
     free( pattern );
 }
 
+/* FSCTL_QUERY_ALLOCATED_RANGES reports the allocated extents of a range as an
+ * array of FILE_ALLOCATED_RANGE_BUFFER, with IoStatus.Information counting the
+ * bytes written.  Measured on Windows Server 2025 (build 26100) by
+ * .github/probes/zero-data-edges.ps1 in GitHub Actions run 32874941089:
+ *
+ *     a fully allocated 1 MB file          -> one extent [0,1048576)
+ *     after punching [262144,786432)       -> [0,262144) and [786432,1048576)
+ *     nothing allocated at all             -> ZERO entries, STATUS_SUCCESS
+ *
+ * The zero-extent case is the one worth being careful about: an empty answer is
+ * a success, so a caller cannot tell "no extents" from "the call failed" by the
+ * status alone -- only by Information being zero. */
+#define QAR_MAX_EXTENTS 16
+
+/* Query [offset,offset+length) and return the number of extents, or -1 on
+ * failure.  The extents are copied into ranges. */
+static int query_ranges( HANDLE h, LONGLONG offset, LONGLONG length,
+                         FILE_ALLOCATED_RANGE_BUFFER *ranges, int line )
+{
+    FILE_ALLOCATED_RANGE_BUFFER query;
+    IO_STATUS_BLOCK io;
+    NTSTATUS res;
+
+    query.FileOffset.QuadPart = offset;
+    query.Length.QuadPart = length;
+    memset( ranges, 0xcc, QAR_MAX_EXTENTS * sizeof(*ranges) );
+    io.Information = 0xdeadbeef;
+    res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                           &query, sizeof(query), ranges,
+                           QAR_MAX_EXTENTS * sizeof(*ranges) );
+    ok_(__FILE__, line)( res == STATUS_SUCCESS, "FSCTL_QUERY_ALLOCATED_RANGES returned %lx\n", res );
+    if (res) return -1;
+    ok_(__FILE__, line)( !(io.Information % sizeof(*ranges)),
+                         "Information %Iu is not a whole number of extents\n", io.Information );
+    return io.Information / sizeof(*ranges);
+}
+
+static void trace_ranges( const FILE_ALLOCATED_RANGE_BUFFER *ranges, int count )
+{
+    int i;
+
+    if (!count) trace( "    <no allocated extents: fully sparse>\n" );
+    for (i = 0; i < count; i++)
+        trace( "    [%I64d,%I64d)\n", ranges[i].FileOffset.QuadPart,
+               ranges[i].FileOffset.QuadPart + ranges[i].Length.QuadPart );
+}
+
+static void test_file_query_allocated_ranges(void)
+{
+    FILE_ALLOCATED_RANGE_BUFFER ranges[QAR_MAX_EXTENTS], query;
+    ULONGLONG eof, alloc, eof2, alloc2, unit;
+    IO_STATUS_BLOCK io;
+    char *pattern;
+    NTSTATUS res;
+    int count;
+    HANDLE h;
+
+    if (!(pattern = malloc( ZERO_DATA_SIZE ))) return;
+    unit = zero_data_measure_unit( pattern );
+
+    /* a file whose every byte has been written: one extent covering it all.
+     * True whether or not the file has been marked sparse -- measured on both. */
+    if ((h = create_temp_file(0)))
+    {
+        if (zero_data_fill( h, pattern ))
+        {
+            count = query_ranges( h, 0, ZERO_DATA_SIZE, ranges, __LINE__ );
+            trace( "fully allocated 1 MB file: %d extent(s)\n", count );
+            trace_ranges( ranges, max( count, 0 ) );
+            ok( count == 1, "a fully allocated file: expected 1 extent, got %d\n", count );
+            if (count == 1)
+            {
+                ok( !ranges[0].FileOffset.QuadPart, "expected extent at 0, got %I64d\n",
+                    ranges[0].FileOffset.QuadPart );
+                ok( ranges[0].Length.QuadPart == ZERO_DATA_SIZE,
+                    "expected a %d-byte extent, got %I64d\n",
+                    ZERO_DATA_SIZE, ranges[0].Length.QuadPart );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* a hole punched in the middle: two extents, one either side.  Both bounds
+     * are multiples of 64 KB, so they are aligned to every granularity the
+     * measured min(16*cluster,65536) rule can produce and the expected extents
+     * do not depend on which one this host uses.
+     *
+     * The extent-count assertion is strict, but only once the punch has
+     * demonstrably happened: a filesystem that cannot release storage leaves one
+     * extent, which is the right answer for the file it actually has. */
+    if ((h = create_temp_file(0)))
+    {
+        mark_sparse( h, __LINE__ );
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, 0x40000, 0xc0000 );
+            ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                count = query_ranges( h, 0, ZERO_DATA_SIZE, ranges, __LINE__ );
+                trace( "1 MB sparse file, [262144,786432) zeroed, alloc %I64u -> %I64u: %d extent(s)\n",
+                       alloc, alloc2, count );
+                trace_ranges( ranges, max( count, 0 ) );
+                if (alloc2 == alloc)
+                    skip( "the filesystem does not release storage for a zeroed range\n" );
+                else
+                {
+                    ok( count == 2, "a punched hole: expected 2 extents, got %d\n", count );
+                    if (count == 2)
+                    {
+                        ok( !ranges[0].FileOffset.QuadPart && ranges[0].Length.QuadPart == 0x40000,
+                            "expected [0,262144), got [%I64d,%I64d)\n", ranges[0].FileOffset.QuadPart,
+                            ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart );
+                        ok( ranges[1].FileOffset.QuadPart == 0xc0000
+                            && ranges[1].Length.QuadPart == ZERO_DATA_SIZE - 0xc0000,
+                            "expected [786432,1048576), got [%I64d,%I64d)\n", ranges[1].FileOffset.QuadPart,
+                            ranges[1].FileOffset.QuadPart + ranges[1].Length.QuadPart );
+                    }
+                }
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* the whole file zeroed on a sparse file: no extents at all, and that is a
+     * STATUS_SUCCESS with Information zero, not an error */
+    if ((h = create_temp_file(0)))
+    {
+        mark_sparse( h, __LINE__ );
+        if (zero_data_fill( h, pattern ) && sparse_test_query( h, &eof, &alloc, __LINE__ ))
+        {
+            res = zero_data( h, 0, ZERO_DATA_SIZE );
+            ok( res == STATUS_SUCCESS, "FSCTL_SET_ZERO_DATA returned %lx\n", res );
+            if (sparse_test_query( h, &eof2, &alloc2, __LINE__ ))
+            {
+                count = query_ranges( h, 0, ZERO_DATA_SIZE, ranges, __LINE__ );
+                trace( "1 MB sparse file, wholly zeroed, alloc %I64u -> %I64u: %d extent(s)\n",
+                       alloc, alloc2, count );
+                trace_ranges( ranges, max( count, 0 ) );
+                ok( eof2 == eof, "expected EndOfFile %I64u, got %I64u\n", eof, eof2 );
+                if (alloc2)
+                    skip( "the filesystem still holds %I64u bytes for a wholly zeroed file\n", alloc2 );
+                else
+                    ok( !count, "a fully sparse file: expected 0 extents, got %d\n", count );
+            }
+        }
+        CloseHandle( h );
+    }
+
+    /* For a file that is not marked sparse, Windows reports the requested range
+     * unchanged, even for an empty file or for a range extending past EOF. */
+    if ((h = create_temp_file(0)))
+    {
+        count = query_ranges( h, 0, ZERO_DATA_SIZE, ranges, __LINE__ );
+        ok( count == 1, "an empty non-sparse file: expected 1 extent, got %d\n", count );
+        if (count == 1)
+            ok( !ranges[0].FileOffset.QuadPart && ranges[0].Length.QuadPart == ZERO_DATA_SIZE,
+                "expected [0,%u), got [%I64d,%I64d)\n", ZERO_DATA_SIZE,
+                ranges[0].FileOffset.QuadPart,
+                ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart );
+        CloseHandle( h );
+    }
+
+    if ((h = create_temp_file(0)))
+    {
+        if (zero_data_fill( h, pattern ))
+        {
+            count = query_ranges( h, 0, ZERO_DATA_SIZE * 4, ranges, __LINE__ );
+            ok( count == 1, "a query past the end of file: expected 1 extent, got %d\n", count );
+            if (count == 1)
+                ok( ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart == ZERO_DATA_SIZE * 4,
+                    "a non-sparse query must be returned unchanged, got [%I64d,%I64d)\n",
+                    ranges[0].FileOffset.QuadPart,
+                    ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart );
+
+            /* A zero-length query describes nothing.  A nonempty query at EOF is
+             * still returned unchanged for a non-sparse file. */
+            count = query_ranges( h, 0x1000, 0, ranges, __LINE__ );
+            ok( !count, "a zero-length query: expected 0 extents, got %d\n", count );
+            query.FileOffset.QuadPart = 0x1000;
+            query.Length.QuadPart = 0;
+            io.Information = 0xdeadbeef;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query), NULL, 0 );
+            ok( res == STATUS_SUCCESS, "a zero-length query without output returned %lx\n", res );
+            ok( !io.Information, "expected Information 0, got %Iu\n", io.Information );
+            count = query_ranges( h, ZERO_DATA_SIZE, ZERO_DATA_SIZE, ranges, __LINE__ );
+            ok( count == 1, "a non-sparse query at EOF: expected 1 extent, got %d\n", count );
+            if (count == 1)
+                ok( ranges[0].FileOffset.QuadPart == ZERO_DATA_SIZE
+                    && ranges[0].Length.QuadPart == ZERO_DATA_SIZE,
+                    "expected [%u,%u), got [%I64d,%I64d)\n", ZERO_DATA_SIZE,
+                    ZERO_DATA_SIZE * 2, ranges[0].FileOffset.QuadPart,
+                    ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart );
+
+            /* a query restricted to part of the file is answered within it */
+            count = query_ranges( h, 0x40000, 0x40000, ranges, __LINE__ );
+            ok( count == 1, "a partial query: expected 1 extent, got %d\n", count );
+            if (count == 1)
+                ok( ranges[0].FileOffset.QuadPart >= 0x40000
+                    && ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart <= 0x80000,
+                    "a partial query must stay inside [262144,524288), got [%I64d,%I64d)\n",
+                    ranges[0].FileOffset.QuadPart,
+                    ranges[0].FileOffset.QuadPart + ranges[0].Length.QuadPart );
+
+            /* Input and output validation required by MS-FSA 2.1.5.10.22. */
+            query.FileOffset.QuadPart = 0;
+            query.Length.QuadPart = ZERO_DATA_SIZE;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query) - 1, ranges, sizeof(ranges) );
+            ok( res == STATUS_INVALID_PARAMETER, "a short input length returned %lx\n", res );
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   NULL, sizeof(query), ranges, sizeof(ranges) );
+            ok( res == STATUS_INVALID_PARAMETER, "a null input buffer returned %lx\n", res );
+            query.FileOffset.QuadPart = -1;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query), ranges, sizeof(ranges) );
+            ok( res == STATUS_INVALID_PARAMETER, "a negative FileOffset returned %lx\n", res );
+            query.FileOffset.QuadPart = 0;
+            query.Length.QuadPart = -1;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query), ranges, sizeof(ranges) );
+            ok( res == STATUS_INVALID_PARAMETER, "a negative Length returned %lx\n", res );
+            query.FileOffset.QuadPart = MAXLONGLONG;
+            query.Length.QuadPart = 1;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query), ranges, sizeof(ranges) );
+            ok( res == STATUS_INVALID_PARAMETER, "an overflowing range returned %lx\n", res );
+            query.FileOffset.QuadPart = 0;
+            query.Length.QuadPart = ZERO_DATA_SIZE;
+            res = NtFsControlFile( h, NULL, NULL, NULL, &io, FSCTL_QUERY_ALLOCATED_RANGES,
+                                   &query, sizeof(query), ranges, sizeof(ranges[0]) - 1 );
+            ok( res == STATUS_BUFFER_TOO_SMALL, "a short output buffer returned %lx\n", res );
+
+            /* an output buffer with room for fewer extents than the file has.
+             * Windows returns a partial list with STATUS_BUFFER_OVERFLOW. */
+            if (unit)
+            {
+                HANDLE h2 = create_temp_file(0);
+
+                if (h2)
+                {
+                    mark_sparse( h2, __LINE__ );
+                    if (zero_data_fill( h2, pattern ) && sparse_test_query( h2, &eof, &alloc, __LINE__ ))
+                    {
+                        zero_data( h2, 0x40000, 0x60000 );
+                        zero_data( h2, 0x80000, 0xa0000 );
+                        if (sparse_test_query( h2, &eof2, &alloc2, __LINE__ ) && alloc2 < alloc)
+                        {
+                            count = query_ranges( h2, 0, ZERO_DATA_SIZE, ranges, __LINE__ );
+                            trace( "two holes punched: %d extent(s)\n", count );
+                            trace_ranges( ranges, max( count, 0 ) );
+                            ok( count == 3, "two punched holes: expected 3 extents, got %d\n", count );
+
+                            query.FileOffset.QuadPart = 0;
+                            query.Length.QuadPart = ZERO_DATA_SIZE;
+                            io.Information = 0xdeadbeef;
+                            res = NtFsControlFile( h2, NULL, NULL, NULL, &io,
+                                                   FSCTL_QUERY_ALLOCATED_RANGES, &query, sizeof(query),
+                                                   ranges, sizeof(ranges[0]) );
+                            ok( res == STATUS_BUFFER_OVERFLOW,
+                                "an output buffer holding one of three extents returned %lx\n", res );
+                            ok( io.Information == sizeof(ranges[0]),
+                                "expected %Iu bytes of partial answer, got %Iu\n",
+                                sizeof(ranges[0]), io.Information );
+                        }
+                        else skip( "the filesystem does not release storage for a zeroed range\n" );
+                    }
+                    CloseHandle( h2 );
+                }
+            }
+        }
+        CloseHandle( h );
+    }
+
+    free( pattern );
+}
+
 static void test_file_basic_information(void)
 {
     FILE_BASIC_INFORMATION fbi, fbi2;
@@ -8192,6 +8470,7 @@ START_TEST(file)
     test_file_allocation_information();
     test_file_sparse_allocation();
     test_file_set_zero_data();
+    test_file_query_allocated_ranges();
     test_file_all_name_information();
     test_create_file_collision_options();
     test_file_rename_information(FileRenameInformation);

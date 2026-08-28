@@ -2082,6 +2082,16 @@ unsigned int get_fd_options( struct fd *fd )
     return fd->options;
 }
 
+unsigned int get_fd_disposition( struct fd *fd )
+{
+    return fd->closed ? fd->closed->disp_flags : 0;
+}
+
+void clear_fd_disposition( struct fd *fd )
+{
+    if (fd->closed) fd->closed->disp_flags = 0;
+}
+
 /* retrieve the completion flags for the fd */
 unsigned int get_fd_comp_flags( struct fd *fd )
 {

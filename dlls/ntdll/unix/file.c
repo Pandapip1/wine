@@ -504,6 +504,60 @@ static int xattr_fget( int filedes, const char *name, void *value, size_t size )
 #endif
 }
 
+
+static ssize_t xattr_flist( int filedes, char *list, size_t size )
+{
+#ifdef HAVE_SYS_XATTR_H
+# ifdef XATTR_ADDITIONAL_OPTIONS
+    return flistxattr( filedes, list, size, 0 );
+# else
+    return flistxattr( filedes, list, size );
+# endif
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+
+/* ntfs-3g's default streams_interface=xattr maps an NTFS named $DATA
+ * attribute called "name" to the Linux extended attribute "user.name".
+ * Recognize the same representation on other xattr-capable filesystems too;
+ * this gives Wine streams inode lifetime semantics instead of creating colon-
+ * named sidecar files. */
+static BOOL xattr_stream_exists_at( int root_fd, char *path )
+{
+    static const char data_type[] = "$DATA";
+    char *component = strrchr( path, '/' );
+    char *colon, *type, *xattr, saved;
+    int fd, ret;
+
+    component = component ? component + 1 : path;
+    if (!(colon = strchr( component, ':' ))) return FALSE;
+    if (!(type = strchr( colon + 1, ':' ))) type = colon + strlen(colon);
+    else if (strcasecmp( type + 1, data_type )) return FALSE;
+    if (strchr( type + (type[0] ? 1 : 0), ':' )) return FALSE;
+
+    saved = *colon;
+    *colon = 0;
+    fd = openat( root_fd, path, O_RDONLY | O_NONBLOCK );
+    *colon = saved;
+    if (fd == -1) return FALSE;
+
+    if (type == colon + 1) ret = 0;  /* the default stream, ::$DATA */
+    else if ((xattr = malloc( sizeof(XATTR_USER_PREFIX) + type - colon )))
+    {
+        memcpy( xattr, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN );
+        memcpy( xattr + XATTR_USER_PREFIX_LEN, colon + 1, type - colon - 1 );
+        xattr[XATTR_USER_PREFIX_LEN + type - colon - 1] = 0;
+        ret = xattr_fget( fd, xattr, NULL, 0 );
+        free( xattr );
+    }
+    else ret = -1;
+    close( fd );
+    return ret >= 0;
+}
+
 /* Retrieve an extended attribute for a name that may be relative to a
  * directory fd.  There is no portable getxattr() that takes a dirfd, so for
  * the relative case open the file and use the fd-based call; a failure to
@@ -729,6 +783,134 @@ static NTSTATUS set_zero_data( int fd, LONGLONG offset, LONGLONG beyond_final_ze
 #endif
     }
     return write_file_zeros( fd, pos, end );
+}
+
+
+/* Report the allocated extents of [offset,offset+length) into an array of
+ * FILE_ALLOCATED_RANGE_BUFFER, for FSCTL_QUERY_ALLOCATED_RANGES.
+ *
+ * Measured on Windows Server 2025 (build 26100) by .github/probes/
+ * zero-data-edges.ps1 and zero-data-cluster.ps1 in GitHub Actions runs
+ * 32874941089 and 32878521315:
+ *
+ *     a fully allocated 1 MB file            -> one extent [0,1048576)
+ *     the same file after punching a hole
+ *       over [262144,786432)                 -> [0,262144) and [786432,1048576)
+ *     a file with no allocated extent at all  -> ZERO entries, STATUS_SUCCESS
+ *
+ * So an empty answer is a success and not an error, and the extent count is the
+ * only thing that distinguishes a punched file from an intact one.  The query
+ * returned the same single range for fully allocated files with and without the
+ * sparse attribute.  The distinction matters once holes exist: as required by
+ * the protocol, ordinary files return the requested range directly, while files
+ * marked sparse report the extents they actually have.
+ *
+ * MS-FSA 2.1.5.10.22 defines the remaining boundary behavior: zero-length
+ * queries succeed without an output buffer; any other query needs room for at
+ * least one range; a short buffer is STATUS_BUFFER_TOO_SMALL, while a buffer
+ * that holds only part of the answer is STATUS_BUFFER_OVERFLOW.  Ordinary
+ * files return the requested range unchanged.  Only sparse files consult their
+ * allocated extents.
+ */
+static NTSTATUS query_allocated_ranges( int fd, LONGLONG offset, LONGLONG length,
+                                        FILE_ALLOCATED_RANGE_BUFFER *out, ULONG out_size,
+                                        ULONG_PTR *ret_size )
+{
+    ULONG max;
+    struct stat st;
+    off_t pos, end;
+
+    *ret_size = 0;
+    if (offset < 0 || length < 0 || length > MAXLONGLONG - offset)
+        return STATUS_INVALID_PARAMETER;
+    if (!length) return STATUS_SUCCESS;
+    if (out_size < sizeof(*out)) return STATUS_BUFFER_TOO_SMALL;
+    if (!out) return STATUS_INVALID_PARAMETER;
+    if (fstat( fd, &st ) == -1) return errno_to_status( errno );
+    if (S_ISDIR( st.st_mode )) return STATUS_INVALID_PARAMETER;
+
+    if (!is_sparse_file( fd ))
+    {
+        out[0].FileOffset.QuadPart = offset;
+        out[0].Length.QuadPart = length;
+        *ret_size = sizeof(*out);
+        return STATUS_SUCCESS;
+    }
+
+    pos = offset;
+    end = offset + length;
+    if (end > st.st_size) end = st.st_size;
+    if (pos >= end) return STATUS_SUCCESS;           /* no extents, and that is a success */
+    max = out_size / sizeof(*out);
+
+#if defined(SEEK_DATA) && defined(SEEK_HOLE)
+    {
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG count = 0;
+
+    while (pos < end)
+    {
+        off_t data, hole;
+
+        if ((data = lseek( fd, pos, SEEK_DATA )) == -1)
+        {
+            /* ENXIO is the ordinary terminator: there is no more data at or
+             * after pos, so every remaining byte of the query is a hole. */
+            if (errno == ENXIO) break;
+            if (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOSYS) goto unsupported;
+            return errno_to_status( errno );
+        }
+        if (data >= end) break;
+        if (data < pos) data = pos;
+        if ((hole = lseek( fd, data, SEEK_HOLE )) == -1)
+        {
+            if (errno == EINVAL || errno == EOPNOTSUPP || errno == ENOSYS) goto unsupported;
+            return errno_to_status( errno );
+        }
+        if (hole > end) hole = end;
+        if (hole <= data) break;                     /* no progress; refuse to spin */
+
+        if (count < max)
+        {
+            out[count].FileOffset.QuadPart = data;
+            out[count].Length.QuadPart     = hole - data;
+            count++;
+        }
+        else status = STATUS_BUFFER_OVERFLOW;
+        pos = hole;
+    }
+    *ret_size = count * sizeof(*out);
+    return status;
+    }
+
+unsupported:
+    WARN( "SEEK_DATA is not supported on this filesystem\n" );
+#else
+    WARN( "SEEK_DATA is not available on this platform\n" );
+#endif
+    /* No way to see holes.  Report the whole queried range as one allocated
+     * extent rather than failing the call.
+     *
+     * The alternative, STATUS_NOT_SUPPORTED, is worse for the reason this
+     * handler exists at all: a caller that can mark a file sparse and punch a
+     * hole in it, and is then told the extent query is unsupported, has to
+     * decide what to believe about a file it just modified.  "Everything in the
+     * range is allocated" is also the exactly correct answer for a file with no
+     * holes, which is nearly every file, and it matches what NT was measured to
+     * return for a file with no sparse attribute.  The cost is confined to the
+     * one case where the fork punched a hole and cannot see it -- and that
+     * needs FALLOC_FL_PUNCH_HOLE, which no platform lacking SEEK_DATA has.
+     *
+     * This is the same trade FSCTL_SET_ZERO_DATA already makes in set_zero_data():
+     * when the filesystem cannot punch, it honours the part of the contract that
+     * is visible in the data and returns success, losing only the space saving.
+     * FSCTL_GET_RETRIEVAL_POINTERS in the same switch likewise answers with one
+     * extent.  Failing here instead would be defensible, but it would be the
+     * only place in the family that does. */
+    out[0].FileOffset.QuadPart = pos;
+    out[0].Length.QuadPart     = end - pos;
+    *ret_size = sizeof(*out);
+    return STATUS_SUCCESS;
 }
 
 
@@ -3897,7 +4079,7 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         char *p;
         unix_name[pos + 1 + ret] = 0;
         for (p = unix_name + pos ; *p; p++) if (*p == '\\') *p = '/';
-        if (!fstatat( root_fd, unix_name, &st, 0 ))
+        if (!fstatat( root_fd, unix_name, &st, 0 ) || (!is_unix && xattr_stream_exists_at( root_fd, unix_name )))
         {
             if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_SUCCESS;
@@ -3933,6 +4115,45 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
         }
 
         status = find_file_in_dir( root_fd, unix_name, pos, name, end - name, is_unix );
+
+        /* A named stream is not a directory entry with ntfs-3g's xattr
+         * interface.  Once ordinary lookup has failed, retry the final
+         * component as base-file-plus-xattr. */
+        if (!is_unix && !name_len && status == STATUS_OBJECT_NAME_NOT_FOUND)
+        {
+            const WCHAR *stream_colon;
+
+            stream_colon = name;
+            while (stream_colon < end && *stream_colon != ':') stream_colon++;
+            if (stream_colon == end) stream_colon = NULL;
+
+            ret = ntdll_wcstoumbs( name, end - name, unix_name + pos + 1,
+                                   MAX_DIR_ENTRY_LEN + 1, TRUE );
+            if (ret > 0 && ret <= MAX_DIR_ENTRY_LEN)
+            {
+                unix_name[pos] = '/';
+                unix_name[pos + ret + 1] = 0;
+                if (xattr_stream_exists_at( root_fd, unix_name )) status = STATUS_SUCCESS;
+            }
+            if (status == STATUS_OBJECT_NAME_NOT_FOUND && stream_colon && stream_colon > name)
+            {
+                unix_name[pos] = 0;
+                status = find_file_in_dir( root_fd, unix_name, pos, name, stream_colon - name, FALSE );
+                if (status == STATUS_SUCCESS)
+                {
+                    int base_len = strlen( unix_name );
+
+                    ret = ntdll_wcstoumbs( stream_colon, end - stream_colon, unix_name + base_len,
+                                           MAX_DIR_ENTRY_LEN + 1, TRUE );
+                    if (ret <= 0 || ret > MAX_DIR_ENTRY_LEN) status = STATUS_OBJECT_NAME_NOT_FOUND;
+                    else
+                    {
+                        unix_name[base_len + ret] = 0;
+                        if (!xattr_stream_exists_at( root_fd, unix_name )) status = STATUS_OBJECT_NAME_NOT_FOUND;
+                    }
+                }
+            }
+        }
 
         /* try to resolve it as a reparse point */
         if (status == STATUS_OBJECT_NAME_NOT_FOUND && (reparse_name = malloc( (end - name + 1) * sizeof(WCHAR) )))
@@ -5259,6 +5480,91 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
 }
 
 
+static BOOL is_wine_metadata_xattr( const char *name )
+{
+    return !strcmp( name, SAMBA_XATTR_DOS_ATTRIB ) || !strcmp( name, XATTR_REPARSE ) ||
+           !strcmp( name, XATTR_SPARSE );
+}
+
+
+static NTSTATUS append_stream_info( FILE_STREAM_INFORMATION **previous, char **cursor, ULONG *remaining,
+                                    const WCHAR *name, ULONG name_len, LONGLONG size,
+                                    LONGLONG allocation_size, ULONG *total )
+{
+    ULONG entry_size = offsetof( FILE_STREAM_INFORMATION, StreamName[name_len] );
+    ULONG aligned_size = dir_info_align( entry_size );
+    FILE_STREAM_INFORMATION *info;
+
+    if (*remaining < entry_size) return STATUS_BUFFER_OVERFLOW;
+
+    info = (FILE_STREAM_INFORMATION *)*cursor;
+    memset( info, 0, entry_size );
+    info->StreamNameLength = name_len * sizeof(WCHAR);
+    info->StreamSize.QuadPart = size;
+    info->StreamAllocationSize.QuadPart = allocation_size;
+    memcpy( info->StreamName, name, name_len * sizeof(WCHAR) );
+    if (*previous) (*previous)->NextEntryOffset = (char *)info - (char *)*previous;
+    *previous = info;
+    if (*total) *total = dir_info_align( *total );
+    *total += entry_size;
+    *cursor += aligned_size;
+    *remaining = *remaining > aligned_size ? *remaining - aligned_size : 0;
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS query_stream_information( int fd, void *buffer, ULONG len, ULONG_PTR *information )
+{
+    static const WCHAR default_name[] = {':',':','$','D','A','T','A'};
+    static const WCHAR data_suffix[] = {':','$','D','A','T','A'};
+    FILE_STREAM_INFORMATION *previous = NULL;
+    char *cursor = buffer, *xattrs = NULL;
+    ULONG remaining = len, total = 0;
+    ssize_t list_size, stream_size;
+    NTSTATUS status = STATUS_SUCCESS;
+    struct stat st;
+    char *name;
+
+    if (fstat( fd, &st ) == -1) return errno_to_status( errno );
+
+    if (S_ISREG( st.st_mode ))
+    {
+        status = append_stream_info( &previous, &cursor, &remaining, default_name,
+                                     ARRAY_SIZE(default_name), st.st_size, st.st_blocks * 512, &total );
+        if (status) goto done;
+    }
+
+    if ((list_size = xattr_flist( fd, NULL, 0 )) <= 0) goto done;
+    if (!(xattrs = malloc( list_size ))) return STATUS_NO_MEMORY;
+    if ((list_size = xattr_flist( fd, xattrs, list_size )) < 0) goto done;
+
+    for (name = xattrs; name < xattrs + list_size; name += strlen(name) + 1)
+    {
+        WCHAR stream_name[MAX_DIR_ENTRY_LEN + ARRAY_SIZE(data_suffix) + 2];
+        ULONG name_len;
+
+        if (strncmp( name, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN ) || is_wine_metadata_xattr( name ))
+            continue;
+        if ((stream_size = xattr_fget( fd, name, NULL, 0 )) < 0) continue;
+        stream_name[0] = ':';
+        name_len = ntdll_umbstowcs( name + XATTR_USER_PREFIX_LEN, strlen(name) - XATTR_USER_PREFIX_LEN,
+                                    stream_name + 1, MAX_DIR_ENTRY_LEN );
+        if ((int)name_len < 0 || name_len > MAX_DIR_ENTRY_LEN) continue;
+        memcpy( stream_name + name_len + 1, data_suffix, sizeof(data_suffix) );
+        name_len += 1 + ARRAY_SIZE(data_suffix);
+        status = append_stream_info( &previous, &cursor, &remaining, stream_name, name_len,
+                                     stream_size, stream_size, &total );
+        if (status) break;
+    }
+
+done:
+    free( xattrs );
+    if (previous) previous->NextEntryOffset = 0;
+    *information = total;
+    return status;
+}
+
+
 /******************************************************************************
  *              NtQueryInformationFile   (NTDLL.@)
  */
@@ -5414,6 +5720,9 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
     switch (class)
     {
+    case FileStreamInformation:
+        status = query_stream_information( fd, ptr, len, &io->Information );
+        break;
     case FileBasicInformation:
         if (fd_get_file_info( handle, fd, options, &st, &attr, NULL ) == -1)
             status = errno_to_status( errno );
@@ -5554,7 +5863,8 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         break;
     }
     if (needs_close) close( fd );
-    if (status == STATUS_SUCCESS && !io->Information) io->Information = info_sizes[class];
+    if (status == STATUS_SUCCESS && !io->Information && class != FileStreamInformation)
+        io->Information = info_sizes[class];
     return io->Status = status;
 }
 
@@ -7284,6 +7594,27 @@ NTSTATUS WINAPI NtFsControlFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         if (needs_close) close( fd );
         break;
     }
+
+    case FSCTL_QUERY_ALLOCATED_RANGES:
+    {
+        const FILE_ALLOCATED_RANGE_BUFFER *query = in_buffer;
+        int fd, needs_close;
+
+        /* This FSCTL is METHOD_NEITHER, but this implementation is handed the
+         * caller's pointers directly.  MS-FSA specifies a minimum input size,
+         * so wrapper structures with surplus input bytes must be accepted. */
+        if (in_size < sizeof(*query) || !in_buffer)
+        {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if ((status = server_get_unix_fd( handle, FILE_READ_DATA, &fd, &needs_close, NULL, NULL )))
+            break;
+        status = query_allocated_ranges( fd, query->FileOffset.QuadPart, query->Length.QuadPart,
+                                         out_buffer, out_size, &size );
+        if (needs_close) close( fd );
+        break;
+    }
     default:
         return server_ioctl_file( handle, event, apc, apc_context, io, code,
                                   in_buffer, in_size, out_buffer, out_size );
@@ -8024,6 +8355,9 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
         default:
             info->FileSystemAttributes = FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS |
                                          FILE_SUPPORTS_OPEN_BY_FILE_ID;
+#ifdef HAVE_SYS_XATTR_H
+            info->FileSystemAttributes |= FILE_NAMED_STREAMS;
+#endif
             info->MaximumComponentNameLength = 255;
             info->FileSystemNameLength = min( sizeof(ntfsW), length - offsetof( FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName ) );
             memcpy(info->FileSystemName, ntfsW, info->FileSystemNameLength);

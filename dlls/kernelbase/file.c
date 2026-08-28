@@ -62,6 +62,17 @@ typedef struct
 
 #define FIND_FIRST_MAGIC  0xc0ffee11
 
+typedef struct
+{
+    DWORD magic;
+    ULONG pos;
+    ULONG len;
+    ULONG reserved;
+    BYTE data[1];
+} FIND_STREAM_INFO;
+
+#define FIND_STREAM_MAGIC 0xc0ffee12
+
 static const UINT max_entry_size = offsetof( FILE_BOTH_DIRECTORY_INFORMATION, FileName[256] );
 
 const WCHAR windows_dir[] = L"C:\\windows";
@@ -1502,9 +1513,81 @@ BOOL WINAPI FindNextFileNameW( HANDLE handle, DWORD *len, WCHAR *link_name )
  */
 HANDLE WINAPI FindFirstStreamW( const WCHAR *filename, STREAM_INFO_LEVELS level, void *data, DWORD flags )
 {
-    FIXME("(%s, %d, %p, %lx): stub!\n", debugstr_w(filename), level, data, flags);
-    SetLastError( ERROR_HANDLE_EOF );
-    return INVALID_HANDLE_VALUE;
+    WIN32_FIND_STREAM_DATA *stream_data = data;
+    FILE_STREAM_INFORMATION *stream;
+    FIND_STREAM_INFO *info = NULL;
+    OBJECT_ATTRIBUTES attr;
+    UNICODE_STRING nt_name;
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+    HANDLE file;
+    ULONG size = 4096;
+
+    TRACE( "(%s, %d, %p, %lx)\n", debugstr_w(filename), level, data, flags );
+
+    if (level != FindStreamInfoStandard || flags || !data)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return INVALID_HANDLE_VALUE;
+    }
+    if (!RtlDosPathNameToNtPathName_U( filename, &nt_name, NULL, NULL ))
+    {
+        SetLastError( ERROR_PATH_NOT_FOUND );
+        return INVALID_HANDLE_VALUE;
+    }
+    InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
+    status = NtOpenFile( &file, FILE_READ_ATTRIBUTES, &attr, &io,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         FILE_OPEN_REPARSE_POINT );
+    RtlFreeUnicodeString( &nt_name );
+    if (status)
+    {
+        set_ntstatus( status );
+        return INVALID_HANDLE_VALUE;
+    }
+
+    for (;;)
+    {
+        if (!(info = HeapAlloc( GetProcessHeap(), 0, offsetof(FIND_STREAM_INFO, data[size]) )))
+        {
+            status = STATUS_NO_MEMORY;
+            break;
+        }
+        status = NtQueryInformationFile( file, &io, info->data, size, FileStreamInformation );
+        if (status != STATUS_BUFFER_OVERFLOW && status != STATUS_INFO_LENGTH_MISMATCH) break;
+        HeapFree( GetProcessHeap(), 0, info );
+        info = NULL;
+        if (size > 1024 * 1024 * 16)
+        {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        size *= 2;
+    }
+    NtClose( file );
+
+    if (status || !io.Information)
+    {
+        HeapFree( GetProcessHeap(), 0, info );
+        if (status) set_ntstatus( status );
+        else SetLastError( ERROR_HANDLE_EOF );
+        return INVALID_HANDLE_VALUE;
+    }
+
+    stream = (FILE_STREAM_INFORMATION *)info->data;
+    if (stream->StreamNameLength >= sizeof(stream_data->cStreamName))
+    {
+        HeapFree( GetProcessHeap(), 0, info );
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return INVALID_HANDLE_VALUE;
+    }
+    stream_data->StreamSize = stream->StreamSize;
+    memcpy( stream_data->cStreamName, stream->StreamName, stream->StreamNameLength );
+    stream_data->cStreamName[stream->StreamNameLength / sizeof(WCHAR)] = 0;
+    info->magic = FIND_STREAM_MAGIC;
+    info->len = io.Information;
+    info->pos = stream->NextEntryOffset ? stream->NextEntryOffset : io.Information;
+    return info;
 }
 
 
@@ -1631,9 +1714,33 @@ BOOL WINAPI DECLSPEC_HOTPATCH FindNextFileW( HANDLE handle, WIN32_FIND_DATAW *da
  */
 BOOL WINAPI FindNextStreamW( HANDLE handle, void *data )
 {
-    FIXME( "(%p, %p): stub!\n", handle, data );
-    SetLastError( ERROR_HANDLE_EOF );
-    return FALSE;
+    FIND_STREAM_INFO *info = handle;
+    WIN32_FIND_STREAM_DATA *stream_data = data;
+    FILE_STREAM_INFORMATION *stream;
+
+    TRACE( "(%p, %p)\n", handle, data );
+    if (!handle || handle == INVALID_HANDLE_VALUE || !data || info->magic != FIND_STREAM_MAGIC)
+    {
+        SetLastError( ERROR_INVALID_HANDLE );
+        return FALSE;
+    }
+    if (info->pos >= info->len)
+    {
+        SetLastError( ERROR_HANDLE_EOF );
+        return FALSE;
+    }
+
+    stream = (FILE_STREAM_INFORMATION *)(info->data + info->pos);
+    if (stream->StreamNameLength >= sizeof(stream_data->cStreamName))
+    {
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return FALSE;
+    }
+    stream_data->StreamSize = stream->StreamSize;
+    memcpy( stream_data->cStreamName, stream->StreamName, stream->StreamNameLength );
+    stream_data->cStreamName[stream->StreamNameLength / sizeof(WCHAR)] = 0;
+    info->pos = stream->NextEntryOffset ? info->pos + stream->NextEntryOffset : info->len;
+    return TRUE;
 }
 
 
@@ -1668,6 +1775,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH FindClose( HANDLE handle )
                 RtlDeleteCriticalSection( &info->cs );
                 HeapFree( GetProcessHeap(), 0, info );
             }
+        }
+        else if (info->magic == FIND_STREAM_MAGIC)
+        {
+            info->magic = 0;
+            HeapFree( GetProcessHeap(), 0, info );
         }
     }
     __EXCEPT_PAGE_FAULT

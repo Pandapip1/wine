@@ -596,6 +596,14 @@ typedef struct _FILE_ZERO_DATA_INFORMATION {
     LARGE_INTEGER BeyondFinalZero;
 } FILE_ZERO_DATA_INFORMATION, *PFILE_ZERO_DATA_INFORMATION;
 
+/* input to FSCTL_QUERY_ALLOCATED_RANGES is one of these describing the range to
+ * query; the output is an array of them, one per allocated extent, and
+ * IoStatus.Information is the number of bytes written */
+typedef struct _FILE_ALLOCATED_RANGE_BUFFER {
+    LARGE_INTEGER FileOffset;
+    LARGE_INTEGER Length;
+} FILE_ALLOCATED_RANGE_BUFFER, *PFILE_ALLOCATED_RANGE_BUFFER;
+
 /* End: _WIN32_WINNT >= 0x0400 */
 
 /*
