@@ -1131,6 +1131,63 @@ static inline NTSTATUS get_cached_fd( HANDLE handle, int *fd, enum server_fd_typ
 
 
 /***********************************************************************
+ *           flush_fd_cache
+ *
+ * Drop every cached handle -> unix fd mapping, closing the unix fds.
+ *
+ * Only clone_process's child calls this, and it has to: the cache is
+ * ordinary process memory, so fork() hands the clone a full copy of the
+ * PARENT's mappings, keyed by the parent's handle values.  A clone
+ * inherits the parent's handle table, so most of those keys do still name
+ * the same object -- but not all of them.  Any handle the parent held
+ * WITHOUT OBJ_INHERIT does not exist in the clone, and wineserver is free
+ * to hand that handle number straight back out for the next object the
+ * clone opens.  get_cached_fd then hits the parent's stale entry and
+ * server_get_unix_fd returns without ever asking the server, so the clone
+ * reads and stats the object the PARENT had on that number.
+ *
+ * The symptom that found this: an ntlibc process forks, and the child
+ * stats its own executable to check it before exec'ing it.  The stat
+ * lands on a recycled handle whose stale entry is the parent's cwd
+ * directory fd, fstat() reports S_IFDIR, and NtQueryInformationFile
+ * answers FILE_ATTRIBUTE_DIRECTORY for a plain PE file -- so execve()
+ * rejects its own binary with EACCES.  The stale entry's access mask is
+ * wrong for the same reason, which is the other way this surfaces:
+ * server_get_unix_fd's own wanted_access check fails and returns
+ * STATUS_ACCESS_DENIED.  It is bursty rather than steady because it
+ * needs a handle number to actually be recycled onto a cached slot.
+ *
+ * The fds are closed, not merely forgotten: fork() duplicated every one
+ * of them into the clone, they refer to the parent's objects, and nothing
+ * in the clone can reach them again once the entry is gone.  Dropping the
+ * mapping costs only a get_handle_fd round trip the next time the clone
+ * touches a handle it really does own.
+ *
+ * No lock is taken: the clone is single-threaded here by construction --
+ * fork() gave it only the calling thread, and this runs before it has
+ * rejoined the server or run any user code.
+ */
+static void flush_fd_cache(void)
+{
+    unsigned int entry, idx;
+
+    for (entry = 0; entry < FD_CACHE_ENTRIES; entry++)
+    {
+        if (!fd_cache[entry]) continue;
+        for (idx = 0; idx < FD_CACHE_BLOCK_SIZE; idx++)
+        {
+            union fd_cache_entry cache;
+
+            cache.data = fd_cache[entry][idx].data;
+            if (!cache.data) continue;
+            fd_cache[entry][idx].data = 0;
+            if (cache.s.type != FD_TYPE_INVALID) close( cache.s.fd - 1 );
+        }
+    }
+}
+
+
+/***********************************************************************
  *           remove_fd_from_cache
  */
 static int remove_fd_from_cache( HANDLE handle )
@@ -1889,6 +1946,10 @@ NTSTATUS clone_process( ULONG flags, HANDLE *process_handle, HANDLE *thread_hand
          * rather than reused; init_thread_pipe below replaces the pipes. */
         close( fd_socket );
         fd_socket = socketfd[0];
+        /* and the same for the handle -> unix fd cache: also the parent's,
+         * also inherited whole by fork(), and dangerous rather than merely
+         * stale once a handle number is recycled (see flush_fd_cache). */
+        flush_fd_cache();
         close( data->request_fd );
         close( data->reply_fd );
         close( data->wait_fd[0] );
