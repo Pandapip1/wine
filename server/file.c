@@ -57,6 +57,7 @@ static const WCHAR file_name[] = {'F','i','l','e'};
 # define XATTR_USER_PREFIX "user."
 #endif
 #define XATTR_USER_PREFIX_LEN (sizeof(XATTR_USER_PREFIX) - 1)
+#define XATTR_EA XATTR_USER_PREFIX "WINEEA"
 
 struct xattr_stream
 {
@@ -373,6 +374,14 @@ static struct object *create_xattr_stream( struct fd *root, const char *name, st
     {
         if (split < 0) *handled = 1;
         return NULL;
+    }
+
+    /* This xattr contains Windows EAs and is not an alternate data stream. */
+    if (xattr && !strcmp( xattr, XATTR_EA ))
+    {
+        *handled = 1;
+        set_error( STATUS_OBJECT_NAME_NOT_FOUND );
+        goto done;
     }
 
     /* Preserve a real Unix colon-named file if one already exists. */

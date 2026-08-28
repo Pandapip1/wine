@@ -1483,7 +1483,7 @@ static void test_info_classes(void)
     strcpy( ea_info->EaName, "foo" );
     strcpy( ea_info->EaName + 4, "bar" );
     ret = NtSetEaFile( child, &io, buffer, offsetof( FILE_FULL_EA_INFORMATION, EaName[8] ) );
-    todo_wine ok( !ret, "got %#lx\n", ret );
+    ok( !ret, "got %#lx\n", ret );
     NtClose( child );
 
     for (unsigned int i = 0; i < ARRAY_SIZE(tests); ++i)
@@ -1649,28 +1649,28 @@ static void test_info_classes(void)
         case FileFullDirectoryInformation:
         {
             const FILE_FULL_DIRECTORY_INFORMATION *info = (void *)buffer;
-            todo_wine ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
+            ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
             check_string( info->FileName, info->FileNameLength, L"file2" );
             break;
         }
         case FileBothDirectoryInformation:
         {
             const FILE_BOTH_DIRECTORY_INFORMATION *info = (void *)buffer;
-            todo_wine ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
+            ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
             check_string( info->FileName, info->FileNameLength, L"file2" );
             break;
         }
         case FileIdBothDirectoryInformation:
         {
             const FILE_ID_BOTH_DIRECTORY_INFORMATION *info = (void *)buffer;
-            todo_wine ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
+            ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
             check_string( info->FileName, info->FileNameLength, L"file2" );
             break;
         }
         case FileIdFullDirectoryInformation:
         {
             const FILE_ID_FULL_DIRECTORY_INFORMATION *info = (void *)buffer;
-            todo_wine ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
+            ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
             check_string( info->FileName, info->FileNameLength, L"file2" );
             break;
         }
@@ -1685,7 +1685,7 @@ static void test_info_classes(void)
         case FileIdExtdBothDirectoryInformation:
         {
             const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION *info = (void *)buffer;
-            todo_wine ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
+            ok( info->EaSize >= 8 && info->EaSize <= 16, "got %#lx\n", info->EaSize );
             ok( !info->ReparsePointTag, "got tag %#lx\n", info->ReparsePointTag );
             check_string( info->FileName, info->FileNameLength, L"file2" );
             break;

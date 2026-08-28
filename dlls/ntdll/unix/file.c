@@ -186,6 +186,11 @@ typedef struct
 
 #define XATTR_REPARSE XATTR_USER_PREFIX "WINEREPARSE"
 
+/* Windows extended attributes share an inode but are not alternate data
+ * streams.  Keep the complete EA list in one reserved xattr so names retain
+ * their full 255-byte range and user.<stream> remains available for ADS. */
+#define XATTR_EA XATTR_USER_PREFIX "WINEEA"
+
 /* A Windows file is not sparse unless it has been explicitly marked so with
  * FSCTL_SET_SPARSE, while a Unix file extended with ftruncate() always has a
  * hole.  The mark is remembered here so that the two can be told apart. */
@@ -520,6 +525,216 @@ static ssize_t xattr_flist( int filedes, char *list, size_t size )
 }
 
 
+struct ea_entry
+{
+    struct list entry;
+    UCHAR flags;
+    UCHAR name_len;
+    USHORT value_len;
+    char data[1];
+};
+
+static void free_ea_list( struct list *list )
+{
+    struct ea_entry *entry, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, list, struct ea_entry, entry )
+    {
+        list_remove( &entry->entry );
+        free( entry );
+    }
+}
+
+static BOOL xattr_missing( int error )
+{
+#ifdef ENODATA
+    if (error == ENODATA) return TRUE;
+#endif
+#ifdef ENOATTR
+    if (error == ENOATTR) return TRUE;
+#endif
+    return error == ENOENT;
+}
+
+static NTSTATUS ea_xattr_error( int error )
+{
+    if (error == E2BIG || error == ERANGE) return STATUS_EA_TOO_LARGE;
+    if (error == ENOSYS || error == ENOTSUP || error == EOPNOTSUPP)
+        return STATUS_EAS_NOT_SUPPORTED;
+    return errno_to_status( error );
+}
+
+static ULONG ea_entry_size( const struct ea_entry *entry )
+{
+    return offsetof( FILE_FULL_EA_INFORMATION, EaName ) + entry->name_len + 1 + entry->value_len;
+}
+
+static struct ea_entry *find_ea_entry( struct list *list, const char *name, UCHAR name_len )
+{
+    struct ea_entry *entry;
+
+    LIST_FOR_EACH_ENTRY( entry, list, struct ea_entry, entry )
+        if (entry->name_len == name_len && !strncasecmp( entry->data, name, name_len )) return entry;
+    return NULL;
+}
+
+static NTSTATUS parse_ea_list( const void *buffer, ULONG length, struct list *list, NTSTATUS malformed )
+{
+    const unsigned char *bytes = buffer;
+    ULONG pos = 0;
+
+    list_init( list );
+    if (!length) return malformed;
+
+    for (;;)
+    {
+        struct ea_entry *entry;
+        ULONG available = length - pos, next_offset, value_offset, size;
+        UCHAR flags, name_len;
+        USHORT value_len;
+
+        if (available < offsetof( FILE_FULL_EA_INFORMATION, EaName )) goto invalid;
+        memcpy( &next_offset, bytes + pos, sizeof(next_offset) );
+        flags = bytes[pos + offsetof( FILE_FULL_EA_INFORMATION, Flags )];
+        name_len = bytes[pos + offsetof( FILE_FULL_EA_INFORMATION, EaNameLength )];
+        memcpy( &value_len, bytes + pos + offsetof( FILE_FULL_EA_INFORMATION, EaValueLength ),
+                sizeof(value_len) );
+        value_offset = offsetof( FILE_FULL_EA_INFORMATION, EaName ) + name_len + 1;
+        size = value_offset + value_len;
+        if (!name_len || size > available || bytes[pos + value_offset - 1]) goto invalid;
+        if (flags & ~0x80)
+        {
+            free_ea_list( list );
+            return STATUS_INVALID_EA_FLAG;
+        }
+        if (!(entry = malloc( offsetof( struct ea_entry, data ) + name_len + 1 + value_len )))
+        {
+            free_ea_list( list );
+            return STATUS_NO_MEMORY;
+        }
+        entry->flags = flags;
+        entry->name_len = name_len;
+        entry->value_len = value_len;
+        memcpy( entry->data, bytes + pos + offsetof( FILE_FULL_EA_INFORMATION, EaName ),
+                name_len + 1 + value_len );
+        list_add_tail( list, &entry->entry );
+
+        if (!next_offset) return STATUS_SUCCESS;
+        if (next_offset < size || (next_offset & 3) || next_offset >= available) goto invalid;
+        pos += next_offset;
+    }
+
+invalid:
+    free_ea_list( list );
+    return malformed;
+}
+
+static NTSTATUS load_ea_list( int fd, struct list *list )
+{
+    void *buffer;
+    ssize_t size;
+    NTSTATUS status;
+
+    list_init( list );
+    if ((size = xattr_fget( fd, XATTR_EA, NULL, 0 )) < 0)
+        return xattr_missing( errno ) ? STATUS_SUCCESS : ea_xattr_error( errno );
+    if (!size) return STATUS_SUCCESS;
+    if (size > 0xffff) return STATUS_EA_CORRUPT_ERROR;
+    if (!(buffer = malloc( size ))) return STATUS_NO_MEMORY;
+    if (xattr_fget( fd, XATTR_EA, buffer, size ) != size)
+    {
+        status = ea_xattr_error( errno );
+        free( buffer );
+        return status;
+    }
+    status = parse_ea_list( buffer, size, list, STATUS_EA_CORRUPT_ERROR );
+    free( buffer );
+    return status;
+}
+
+static NTSTATUS save_ea_list( int fd, struct list *list )
+{
+    struct ea_entry *entry;
+    unsigned char *buffer, *ptr;
+    ULONG size = 0;
+    int ret;
+
+    if (list_empty( list ))
+    {
+        ret = xattr_fremove( fd, XATTR_EA );
+        if (!ret || xattr_missing( errno )) return STATUS_SUCCESS;
+        return ea_xattr_error( errno );
+    }
+
+    LIST_FOR_EACH_ENTRY( entry, list, struct ea_entry, entry )
+    {
+        ULONG entry_size = (ea_entry_size( entry ) + 3) & ~3;
+        if (size > 0xffff - entry_size) return STATUS_EA_TOO_LARGE;
+        size += entry_size;
+    }
+    if (!(buffer = calloc( 1, size ))) return STATUS_NO_MEMORY;
+    ptr = buffer;
+    LIST_FOR_EACH_ENTRY( entry, list, struct ea_entry, entry )
+    {
+        FILE_FULL_EA_INFORMATION *info = (FILE_FULL_EA_INFORMATION *)ptr;
+        ULONG entry_size = (ea_entry_size( entry ) + 3) & ~3;
+
+        info->NextEntryOffset = entry->entry.next == list ? 0 : entry_size;
+        info->Flags = entry->flags;
+        info->EaNameLength = entry->name_len;
+        info->EaValueLength = entry->value_len;
+        memcpy( info->EaName, entry->data, entry->name_len + 1 + entry->value_len );
+        ptr += entry_size;
+    }
+    ret = xattr_fset( fd, XATTR_EA, buffer, size );
+    free( buffer );
+    return ret < 0 ? ea_xattr_error( errno ) : STATUS_SUCCESS;
+}
+
+static ULONG ea_list_packed_size( struct list *list )
+{
+    struct ea_entry *entry;
+    ULONG size = 0;
+
+    LIST_FOR_EACH_ENTRY( entry, list, struct ea_entry, entry )
+        size += sizeof(entry->flags) + sizeof(entry->name_len) + sizeof(entry->value_len) +
+                entry->name_len + 1 + entry->value_len;
+    return size;
+}
+
+static ULONG get_ea_size_fd( int fd )
+{
+    struct list entries;
+    ULONG size = 0;
+
+    if (!load_ea_list( fd, &entries ))
+    {
+        size = ea_list_packed_size( &entries );
+        free_ea_list( &entries );
+    }
+    return size;
+}
+
+static ULONG get_ea_size_path( const char *path )
+{
+    struct list entries;
+    void *buffer;
+    ssize_t size;
+    ULONG ret = 0;
+
+    if ((size = xattr_get( path, XATTR_EA, NULL, 0 )) <= 0 || size > 0xffff) return 0;
+    if (!(buffer = malloc( size ))) return 0;
+    if (xattr_get( path, XATTR_EA, buffer, size ) == size &&
+        !parse_ea_list( buffer, size, &entries, STATUS_EA_CORRUPT_ERROR ))
+    {
+        ret = ea_list_packed_size( &entries );
+        free_ea_list( &entries );
+    }
+    free( buffer );
+    return ret;
+}
+
+
 /* ntfs-3g's default streams_interface=xattr maps an NTFS named $DATA
  * attribute called "name" to the Linux extended attribute "user.name".
  * Recognize the same representation on other xattr-capable filesystems too;
@@ -550,7 +765,7 @@ static BOOL xattr_stream_exists_at( int root_fd, char *path )
         memcpy( xattr, XATTR_USER_PREFIX, XATTR_USER_PREFIX_LEN );
         memcpy( xattr + XATTR_USER_PREFIX_LEN, colon + 1, type - colon - 1 );
         xattr[XATTR_USER_PREFIX_LEN + type - colon - 1] = 0;
-        ret = xattr_fget( fd, xattr, NULL, 0 );
+        ret = strcmp( xattr, XATTR_EA ) ? xattr_fget( fd, xattr, NULL, 0 ) : -1;
         free( xattr );
     }
     else ret = -1;
@@ -2924,7 +3139,7 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     const struct dir_data_names *names = &dir_data->names[dir_data->pos];
     union file_directory_info *info;
     struct stat st;
-    ULONG name_len, start, dir_size, attributes, reparse_tag;
+    ULONG name_len, start, dir_size, attributes, reparse_tag, ea_size;
 
     if (get_file_info( names->unix_name, &st, &attributes, &reparse_tag ) == -1)
     {
@@ -2936,6 +3151,7 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
         TRACE( "ignoring file %s\n", debugstr_a(names->unix_name) );
         return STATUS_SUCCESS;
     }
+    ea_size = get_ea_size_path( names->unix_name );
     start = dir_info_align( io->Information );
     dir_size = dir_info_size( class, 0 );
     if (start + dir_size > max_length) return STATUS_MORE_ENTRIES;
@@ -2964,24 +3180,24 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
 
     case FileFullDirectoryInformation:
         /* non-Extd classes return the reparse tag in EaSize if there is one */
-        info->full.EaSize = reparse_tag;
+        info->full.EaSize = reparse_tag ? reparse_tag : ea_size;
         info->full.FileNameLength = name_len;
         break;
 
     case FileIdFullDirectoryInformation:
-        info->id_full.EaSize = reparse_tag;
+        info->id_full.EaSize = reparse_tag ? reparse_tag : ea_size;
         info->id_full.FileNameLength = name_len;
         break;
 
     case FileBothDirectoryInformation:
-        info->both.EaSize = reparse_tag;
+        info->both.EaSize = reparse_tag ? reparse_tag : ea_size;
         info->both.ShortNameLength = wcslen( names->short_name ) * sizeof(WCHAR);
         memcpy( info->both.ShortName, names->short_name, info->both.ShortNameLength );
         info->both.FileNameLength = name_len;
         break;
 
     case FileIdBothDirectoryInformation:
-        info->id_both.EaSize = reparse_tag;
+        info->id_both.EaSize = reparse_tag ? reparse_tag : ea_size;
         info->id_both.ShortNameLength = wcslen( names->short_name ) * sizeof(WCHAR);
         memcpy( info->id_both.ShortName, names->short_name, info->id_both.ShortNameLength );
         info->id_both.FileNameLength = name_len;
@@ -2989,7 +3205,7 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
 
     case FileIdExtdBothDirectoryInformation:
         /* Extd classes do *not* return the reparse tag in EaSize */
-        info->extd_both.EaSize = 0; /* FIXME */
+        info->extd_both.EaSize = ea_size;
         info->extd_both.ReparsePointTag = reparse_tag;
         info->extd_both.ShortNameLength = wcslen( names->short_name ) * sizeof(WCHAR);
         memcpy( info->extd_both.ShortName, names->short_name, info->extd_both.ShortNameLength );
@@ -5483,7 +5699,7 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
 static BOOL is_wine_metadata_xattr( const char *name )
 {
     return !strcmp( name, SAMBA_XATTR_DOS_ATTRIB ) || !strcmp( name, XATTR_REPARSE ) ||
-           !strcmp( name, XATTR_SPARSE );
+           !strcmp( name, XATTR_SPARSE ) || !strcmp( name, XATTR_EA );
 }
 
 
@@ -5761,7 +5977,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
     case FileEaInformation:
         {
             FILE_EA_INFORMATION *info = ptr;
-            info->EaSize = 0;
+            info->EaSize = get_ea_size_fd( fd );
         }
         break;
     case FileEndOfFileInformation:
@@ -5782,7 +5998,7 @@ NTSTATUS WINAPI NtQueryInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
 
                 fill_file_info( &st, attr, info, FileAllInformation );
                 info->StandardInformation.DeletePending = FALSE; /* FIXME */
-                info->EaInformation.EaSize = 0;
+                info->EaInformation.EaSize = get_ea_size_fd( fd );
                 info->AccessInformation.AccessFlags = 0;  /* FIXME */
                 info->PositionInformation.CurrentByteOffset.QuadPart = lseek( fd, 0, SEEK_CUR );
                 info->ModeInformation.Mode = 0;  /* FIXME */
@@ -8468,30 +8684,121 @@ NTSTATUS WINAPI NtQueryEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer,
                                BOOLEAN single_entry, void *list, ULONG list_len,
                                ULONG *index, BOOLEAN restart )
 {
+    FILE_FULL_EA_INFORMATION *previous = NULL;
+    struct ea_entry *entry;
+    struct list entries;
+    ULONG offset = 0, used = 0;
     int fd, needs_close;
-    NTSTATUS status;
+    NTSTATUS status = STATUS_SUCCESS;
 
-    FIXME( "(%p,%p,%p,%d,%d,%p,%d,%p,%d) semi-stub\n",
+    TRACE( "(%p,%p,%p,%d,%d,%p,%d,%p,%d)\n",
            handle, io, buffer, length, single_entry, list, list_len, index, restart );
 
-    if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+    if ((status = server_get_unix_fd( handle, FILE_READ_EA, &fd, &needs_close, NULL, NULL )))
         return status;
 
-    if (buffer && length)
-        memset( buffer, 0, length );
-
+    status = load_ea_list( fd, &entries );
     if (needs_close) close( fd );
-    return STATUS_NO_EAS_ON_FILE;
-}
+    if (status) return status;
 
+    if (list || list_len || index || !restart)
+        FIXME( "EA name lists, indices, and restart scans are not implemented\n" );
+
+    if (list_empty( &entries ))
+    {
+        if (buffer && length) memset( buffer, 0, length );
+        return STATUS_NO_EAS_ON_FILE;
+    }
+    if (!io || !virtual_check_buffer_for_write( io, sizeof(*io) ) ||
+        !virtual_check_buffer_for_write( buffer, length ))
+    {
+        free_ea_list( &entries );
+        return STATUS_ACCESS_VIOLATION;
+    }
+
+    LIST_FOR_EACH_ENTRY( entry, &entries, struct ea_entry, entry )
+    {
+        FILE_FULL_EA_INFORMATION *info;
+        ULONG size = ea_entry_size( entry );
+
+        if (offset > length || size > length - offset)
+        {
+            status = STATUS_BUFFER_OVERFLOW;
+            break;
+        }
+        info = (FILE_FULL_EA_INFORMATION *)((char *)buffer + offset);
+        memset( info, 0, size );
+        info->Flags = entry->flags;
+        info->EaNameLength = entry->name_len;
+        info->EaValueLength = entry->value_len;
+        memcpy( info->EaName, entry->data, entry->name_len + 1 + entry->value_len );
+        if (previous) previous->NextEntryOffset = (char *)info - (char *)previous;
+        previous = info;
+        used = offset + size;
+        if (single_entry) break;
+        offset = (used + 3) & ~3;
+    }
+    if (previous) previous->NextEntryOffset = 0;
+    free_ea_list( &entries );
+    io->Information = used;
+    return io->Status = status;
+}
 
 /******************************************************************
  *           NtSetEaFile   (NTDLL.@)
  */
 NTSTATUS WINAPI NtSetEaFile( HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length )
 {
-    FIXME( "(%p,%p,%p,%d) stub\n", handle, io, buffer, length );
-    return STATUS_ACCESS_DENIED;
+    struct ea_entry *entry, *next, *old;
+    struct list entries, updates;
+    int fd, needs_close;
+    NTSTATUS status;
+
+    TRACE( "(%p,%p,%p,%d)\n", handle, io, buffer, length );
+
+    if ((status = server_get_unix_fd( handle, FILE_WRITE_EA, &fd, &needs_close, NULL, NULL )))
+        return status;
+    if (!io || !virtual_check_buffer_for_write( io, sizeof(*io) ) ||
+        !virtual_check_buffer_for_read( buffer, length ))
+    {
+        status = STATUS_ACCESS_VIOLATION;
+        goto done;
+    }
+    if (length > 0xffff)
+    {
+        status = STATUS_EA_TOO_LARGE;
+        goto done;
+    }
+    if ((status = parse_ea_list( buffer, length, &updates, STATUS_EA_LIST_INCONSISTENT )))
+        goto done;
+    if ((status = load_ea_list( fd, &entries )))
+    {
+        free_ea_list( &updates );
+        goto done;
+    }
+
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &updates, struct ea_entry, entry )
+    {
+        if ((old = find_ea_entry( &entries, entry->data, entry->name_len )))
+        {
+            list_remove( &old->entry );
+            free( old );
+        }
+        list_remove( &entry->entry );
+        if (entry->value_len) list_add_tail( &entries, &entry->entry );
+        else free( entry );
+    }
+    status = save_ea_list( fd, &entries );
+    free_ea_list( &entries );
+
+done:
+    if (needs_close) close( fd );
+    if (!status)
+    {
+        io->Status = STATUS_SUCCESS;
+        io->Information = 0;
+    }
+    return status;
 }
 
 

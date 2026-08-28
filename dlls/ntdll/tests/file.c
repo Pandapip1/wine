@@ -85,6 +85,7 @@ static NTSTATUS (WINAPI *pNtQueryVolumeInformationFile)(HANDLE,PIO_STATUS_BLOCK,
 static NTSTATUS (WINAPI *pNtQueryFullAttributesFile)(const OBJECT_ATTRIBUTES*, FILE_NETWORK_OPEN_INFORMATION*);
 static NTSTATUS (WINAPI *pNtFlushBuffersFile)(HANDLE, IO_STATUS_BLOCK*);
 static NTSTATUS (WINAPI *pNtQueryEaFile)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG,BOOLEAN,PVOID,ULONG,PULONG,BOOLEAN);
+static NTSTATUS (WINAPI *pNtSetEaFile)(HANDLE,PIO_STATUS_BLOCK,PVOID,ULONG);
 
 static WCHAR fooW[] = {'f','o','o',0};
 
@@ -6880,6 +6881,7 @@ static void test_query_ea(void)
 #define EA_BUFFER_SIZE 4097
     unsigned char data[EA_BUFFER_SIZE + 8];
     unsigned char *buffer = (void *)(((DWORD_PTR)data + 7) & ~7);
+    FILE_FULL_EA_INFORMATION *first, *second;
     DWORD buffer_len, i;
     IO_STATUS_BLOCK io;
     NTSTATUS status;
@@ -6950,6 +6952,72 @@ static void test_query_ea(void)
     for (i = 0; i < buffer_len && !buffer[i]; i++);
     ok(i == buffer_len,  "expected %lu bytes filled with 0x00, got %lu bytes\n", buffer_len, i);
     ok(buffer[i] == 0xcc, "data at position %u overwritten\n", buffer[i]);
+
+    /* Store, enumerate, update, and remove extended attributes. */
+    memset(buffer, 0, EA_BUFFER_SIZE);
+    first = (FILE_FULL_EA_INFORMATION *)buffer;
+    first->NextEntryOffset = 16;
+    first->EaNameLength = 3;
+    first->EaValueLength = 3;
+    memcpy( first->EaName, "foo\0bar", 7 );
+    second = (FILE_FULL_EA_INFORMATION *)(buffer + first->NextEntryOffset);
+    second->EaNameLength = 4;
+    second->EaValueLength = 5;
+    memcpy( second->EaName, "test\0value", 10 );
+    buffer_len = 16 + offsetof(FILE_FULL_EA_INFORMATION, EaName[10]);
+    io.Status = 0xdeadbeef;
+    io.Information = 0xdeadbeef;
+    status = pNtSetEaFile( handle, &io, buffer, buffer_len );
+    if (status == STATUS_EAS_NOT_SUPPORTED)
+    {
+        win_skip("filesystem does not support extended attributes\n");
+        CloseHandle(handle);
+        return;
+    }
+    ok( status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", status );
+    ok( io.Status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", io.Status );
+    ok( !io.Information, "expected 0, got %#Ix\n", io.Information );
+
+    memset(buffer, 0xcc, EA_BUFFER_SIZE);
+    status = pNtQueryEaFile( handle, &io, buffer, EA_BUFFER_SIZE, FALSE, NULL, 0, NULL, TRUE );
+    ok( status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", status );
+    first = (FILE_FULL_EA_INFORMATION *)buffer;
+    ok( first->NextEntryOffset == 16, "expected 16, got %lu\n", first->NextEntryOffset );
+    ok( first->EaNameLength == 3, "expected 3, got %u\n", first->EaNameLength );
+    ok( first->EaValueLength == 3, "expected 3, got %u\n", first->EaValueLength );
+    ok( !memcmp( first->EaName, "foo\0bar", 7 ), "unexpected first EA contents\n" );
+    second = (FILE_FULL_EA_INFORMATION *)(buffer + first->NextEntryOffset);
+    ok( !second->NextEntryOffset, "expected 0, got %lu\n", second->NextEntryOffset );
+    ok( second->EaNameLength == 4, "expected 4, got %u\n", second->EaNameLength );
+    ok( second->EaValueLength == 5, "expected 5, got %u\n", second->EaValueLength );
+    ok( !memcmp( second->EaName, "test\0value", 10 ), "unexpected second EA contents\n" );
+
+    memset(buffer, 0, EA_BUFFER_SIZE);
+    first = (FILE_FULL_EA_INFORMATION *)buffer;
+    first->EaNameLength = 3;
+    memcpy( first->EaName, "FOO", 4 );
+    status = pNtSetEaFile( handle, &io, buffer,
+                           offsetof(FILE_FULL_EA_INFORMATION, EaName[4]) );
+    ok( status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", status );
+
+    memset(buffer, 0xcc, EA_BUFFER_SIZE);
+    status = pNtQueryEaFile( handle, &io, buffer, EA_BUFFER_SIZE, FALSE, NULL, 0, NULL, TRUE );
+    ok( status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", status );
+    first = (FILE_FULL_EA_INFORMATION *)buffer;
+    ok( !first->NextEntryOffset, "expected 0, got %lu\n", first->NextEntryOffset );
+    ok( first->EaNameLength == 4, "expected 4, got %u\n", first->EaNameLength );
+    ok( first->EaValueLength == 5, "expected 5, got %u\n", first->EaValueLength );
+    ok( !memcmp( first->EaName, "test\0value", 10 ), "unexpected remaining EA contents\n" );
+
+    memset(buffer, 0, EA_BUFFER_SIZE);
+    first = (FILE_FULL_EA_INFORMATION *)buffer;
+    first->EaNameLength = 4;
+    memcpy( first->EaName, "test", 5 );
+    status = pNtSetEaFile( handle, &io, buffer,
+                           offsetof(FILE_FULL_EA_INFORMATION, EaName[5]) );
+    ok( status == STATUS_SUCCESS, "expected STATUS_SUCCESS, got %#lx\n", status );
+    status = pNtQueryEaFile( handle, &io, buffer, EA_BUFFER_SIZE, FALSE, NULL, 0, NULL, TRUE );
+    ok( status == STATUS_NO_EAS_ON_FILE, "expected STATUS_NO_EAS_ON_FILE, got %#lx\n", status );
 
     CloseHandle(handle);
 #undef EA_BUFFER_SIZE
@@ -8450,6 +8518,7 @@ START_TEST(file)
     pNtQueryFullAttributesFile = (void *)GetProcAddress(hntdll, "NtQueryFullAttributesFile");
     pNtFlushBuffersFile = (void *)GetProcAddress(hntdll, "NtFlushBuffersFile");
     pNtQueryEaFile          = (void *)GetProcAddress(hntdll, "NtQueryEaFile");
+    pNtSetEaFile            = (void *)GetProcAddress(hntdll, "NtSetEaFile");
 
     test_read_write();
     test_NtCreateFile();
