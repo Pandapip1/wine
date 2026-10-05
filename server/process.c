@@ -662,8 +662,6 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->is_system       = 0;
     process->debug_children  = 1;
     process->is_terminating  = 0;
-    process->is_clone        = 0;
-    process->clone_race_forced = 0;
     process->imagelen        = 0;
     process->image           = NULL;
     process->job             = NULL;
@@ -1589,7 +1587,6 @@ DECL_HANDLER(clone_process)
      * writes on handles the copy above already inherited, so getting real
      * sharing right for any of the three is out of scope here. */
     process->startup_state  = STARTUP_DONE;  /* continuing, not starting up */
-    process->is_clone       = 1;
 
     if (!(thread = create_thread( -1, process, NULL ))) goto done;
     /* always suspended, regardless of the caller's flags: measured against
@@ -1598,15 +1595,6 @@ DECL_HANDLER(clone_process)
      * CREATE_SUSPENDED was requested -- see stage0-pe32/M2libc's own
      * x86/windows/process.c, __clone_process's comment above its call. */
     thread->suspend++;
-    /* give the clone's initial thread its context object up front, before the
-     * parent is handed a thread handle it could call NtGetContextThread on.
-     * Without this there is a window -- between the clone's init_first_thread
-     * and the server processing the clone's first select -- in which
-     * get_thread_context finds thread->context == NULL, calls stop_thread(),
-     * and SIGUSR1s a thread whose client side is already parked in
-     * wait_suspend(); the resulting nested wait_suspend deadlocks the clone.
-     * See set_thread_pending_context() in thread.c for the full mechanism. */
-    set_thread_pending_context( thread );
     add_process_thread( process, thread );
 
     reply->pid = get_process_id( process );
