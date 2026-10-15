@@ -3662,7 +3662,8 @@ static HRESULT WINAPI filesys_GetAbsolutePathName(IFileSystem3 *iface, BSTR path
     if(!pbstrResult)
         return E_POINTER;
 
-    len = GetFullPathNameW(path ? path : L".", MAX_PATH, buf, NULL);
+    /* An empty path is the current directory, as NULL is: GetFullPathName() fails on "". */
+    len = GetFullPathNameW(path && *path ? path : L".", MAX_PATH, buf, NULL);
     if(!len)
         return E_FAIL;
 
