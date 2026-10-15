@@ -281,8 +281,19 @@ static UINT64 read_tsc_frequency(void)
             tsc3 = __rdtsc(); __cpuid( regs, 0 );
         }
 
+        if (time1 <= time0)  /* the system time did not advance (coarse or frozen clock) */
+        {
+            error = 1000000;
+            continue;
+        }
+
         freq0 = (tsc2 - tsc0) * 10000000 / (time1 - time0);
         freq1 = (tsc3 - tsc1) * 10000000 / (time1 - time0);
+        if (freq0 <= 0 || freq1 <= 0)
+        {
+            error = 1000000;
+            continue;
+        }
         error = llabs( (freq1 - freq0) * 1000000 / min( freq1, freq0 ) );
     }
     while (error > 500 && --retries);
