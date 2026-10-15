@@ -2535,11 +2535,47 @@ static HRESULT WINAPI folder_get_Name(IFolder *iface, BSTR *name)
     return S_OK;
 }
 
+/* Build the path of an object renamed to |name| within its current parent folder. */
+static HRESULT get_renamed_path(const WCHAR *path, DWORD path_len, const WCHAR *name, WCHAR *new_path)
+{
+    DWORD len, name_len = lstrlenW(name);
+
+    if(!name_len || wcspbrk(name, L"\\/:*?\"<>|"))
+        return E_INVALIDARG;
+
+    len = get_parent_folder_name(path, path_len);
+    if(!len || len + 1 + name_len >= MAX_PATH)
+        return E_FAIL;
+
+    memcpy(new_path, path, len * sizeof(WCHAR));
+    new_path[len++] = '\\';
+    memcpy(new_path + len, name, (name_len + 1) * sizeof(WCHAR));
+    return S_OK;
+}
+
 static HRESULT WINAPI folder_put_Name(IFolder *iface, BSTR name)
 {
     struct folder *This = impl_from_IFolder(iface);
-    FIXME("(%p)->(%s): stub\n", This, debugstr_w(name));
-    return E_NOTIMPL;
+    WCHAR new_path[MAX_PATH];
+    BSTR path;
+    HRESULT hr;
+
+    TRACE("%p, %s.\n", iface, debugstr_w(name));
+
+    if(!name)
+        return E_INVALIDARG;
+
+    if(FAILED(hr = get_renamed_path(This->path, SysStringLen(This->path), name, new_path)))
+        return hr;
+
+    if(!MoveFileW(This->path, new_path))
+        return create_error(GetLastError());
+
+    if(!(path = SysAllocString(new_path)))
+        return E_OUTOFMEMORY;
+    SysFreeString(This->path);
+    This->path = path;
+    return S_OK;
 }
 
 static HRESULT WINAPI folder_get_ShortPath(IFolder *iface, BSTR *path)
@@ -3041,11 +3077,28 @@ static HRESULT WINAPI file_get_Name(IFile *iface, BSTR *name)
     return S_OK;
 }
 
-static HRESULT WINAPI file_put_Name(IFile *iface, BSTR pbstrName)
+static HRESULT WINAPI file_put_Name(IFile *iface, BSTR name)
 {
     struct file *This = impl_from_IFile(iface);
-    FIXME("(%p)->(%s)\n", This, debugstr_w(pbstrName));
-    return E_NOTIMPL;
+    WCHAR new_path[MAX_PATH], *path;
+    HRESULT hr;
+
+    TRACE("%p, %s.\n", iface, debugstr_w(name));
+
+    if(!name)
+        return E_INVALIDARG;
+
+    if(FAILED(hr = get_renamed_path(This->path, lstrlenW(This->path), name, new_path)))
+        return hr;
+
+    if(!MoveFileW(This->path, new_path))
+        return create_error(GetLastError());
+
+    if(!(path = wcsdup(new_path)))
+        return E_OUTOFMEMORY;
+    free(This->path);
+    This->path = path;
+    return S_OK;
 }
 
 static HRESULT WINAPI file_get_ShortPath(IFile *iface, BSTR *pbstrPath)
