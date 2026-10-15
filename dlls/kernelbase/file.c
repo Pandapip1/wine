@@ -1145,6 +1145,28 @@ BOOL WINAPI DECLSPEC_HOTPATCH DeleteFileW( LPCWSTR path )
     }
 
     InitializeObjectAttributes( &attr, &nameW, OBJ_CASE_INSENSITIVE, 0, NULL );
+
+    /* Like current Windows, delete with POSIX semantics: the name is removed as soon as our
+     * handle is closed, or the call fails (e.g. STATUS_CANNOT_DELETE for a file with a mapped
+     * view). Delete-on-close would report success while the name lingers until the last
+     * handle or mapping goes away, which breaks callers that replace the file right after. */
+    status = NtCreateFile( &hFile, SYNCHRONIZE | DELETE, &attr, &io, NULL, 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                           FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, NULL, 0 );
+    if (status == STATUS_SUCCESS)
+    {
+        FILE_DISPOSITION_INFORMATION_EX info = { FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS };
+
+        status = NtSetInformationFile( hFile, &io, &info, sizeof(info), FileDispositionInformationEx );
+        NtClose( hFile );
+        if (status == STATUS_SUCCESS || status == STATUS_CANNOT_DELETE)
+        {
+            RtlFreeUnicodeString( &nameW );
+            return set_ntstatus( status );
+        }
+        /* any other result (not supported, not a regular file, ...): use the legacy path below */
+    }
+
     status = NtCreateFile( &hFile, SYNCHRONIZE | DELETE, &attr, &io, NULL, 0,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
                            FILE_DELETE_ON_CLOSE | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT, NULL, 0 );

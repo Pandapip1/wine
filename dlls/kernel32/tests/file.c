@@ -1871,6 +1871,7 @@ static void test_DeleteFileA( void )
     char temp_path[MAX_PATH], temp_file[MAX_PATH];
     HANDLE hfile, mapping;
     char **argv;
+    void *view;
 
     ret = DeleteFileA(NULL);
     ok(!ret && (GetLastError() == ERROR_INVALID_PARAMETER ||
@@ -1939,6 +1940,31 @@ static void test_DeleteFileA( void )
     ok(ret, "got error %lu\n", GetLastError());
 
     CloseHandle(hfile);
+
+    /* a file with a mapped data view cannot be deleted either, and must not be
+     * reported as deleted while it is still there */
+    ret = CopyFileA(argv[0], temp_file, FALSE);
+    ok(ret, "got error %lu\n", GetLastError());
+    hfile = CreateFileA(temp_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, 0);
+    ok(hfile != INVALID_HANDLE_VALUE, "got error %lu\n", GetLastError());
+    mapping = CreateFileMappingA(hfile, NULL, PAGE_READONLY, 0, 0, NULL);
+    ok(!!mapping, "got error %lu\n", GetLastError());
+    view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    ok(!!view, "got error %lu\n", GetLastError());
+    CloseHandle(mapping);
+    CloseHandle(hfile);
+
+    SetLastError(0xdeadbeef);
+    ret = DeleteFileA(temp_file);
+    ok(!ret || broken(ret) /* older versions of Windows */, "expected failure\n");
+    if (!ret) ok(GetLastError() == ERROR_ACCESS_DENIED, "got error %lu\n", GetLastError());
+    ok(GetFileAttributesA(temp_file) != INVALID_FILE_ATTRIBUTES || broken(ret),
+       "file shouldn't be gone while it is mapped\n");
+
+    UnmapViewOfFile(view);
+    ret = DeleteFileA(temp_file);
+    ok(ret || broken(GetLastError() == ERROR_FILE_NOT_FOUND), "got error %lu\n", GetLastError());
+    ok(GetFileAttributesA(temp_file) == INVALID_FILE_ATTRIBUTES, "file should be gone\n");
 }
 
 static void test_DeleteFileW( void )
