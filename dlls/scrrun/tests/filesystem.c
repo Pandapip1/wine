@@ -1035,6 +1035,12 @@ static void test_CopyFolder(void)
     bsrc = SysAllocString(filesystem3_dir);
     hr = IFileSystem3_DeleteFolder(fs3, bsrc, VARIANT_FALSE);
     ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+
+    /* the folder is gone now */
+    hr = IFileSystem3_DeleteFolder(fs3, bsrc, VARIANT_FALSE);
+    ok(hr == CTL_E_PATHNOTFOUND, "Unexpected hr %#lx.\n", hr);
+    hr = IFileSystem3_DeleteFolder(fs3, bsrc, VARIANT_TRUE);
+    ok(hr == CTL_E_PATHNOTFOUND, "Unexpected hr %#lx.\n", hr);
     SysFreeString(bsrc);
 }
 

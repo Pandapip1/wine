@@ -3947,8 +3947,11 @@ static HRESULT delete_folder(const WCHAR *folder, DWORD folder_len, VARIANT_BOOL
     HRESULT hr;
 
     f = FindFirstFileW(folder, &ffd);
-    if(f == INVALID_HANDLE_VALUE)
-        return create_error(GetLastError());
+    if(f == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        /* a folder that does not exist is a "Path not found" error, not "File not found" */
+        return err == ERROR_FILE_NOT_FOUND ? CTL_E_PATHNOTFOUND : create_error(err);
+    }
 
     len = get_parent_folder_name(folder, folder_len);
     if(len+1 >= MAX_PATH) {
