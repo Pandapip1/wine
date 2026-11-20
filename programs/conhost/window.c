@@ -626,9 +626,11 @@ static void update_window( struct console *console )
         SetWindowPos( console->win, 0, 0, 0, dx, dy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE );
 
         SystemParametersInfoW( SPI_GETWORKAREA, 0, &r, 0 );
-        console->active->max_width  = (r.right - r.left) / console->active->font.width;
+        /* See the WM_SIZE handler below for why font.width/height are
+         * clamped rather than trusted directly at every division site. */
+        console->active->max_width  = (r.right - r.left) / max( console->active->font.width, 1 );
         console->active->max_height = (r.bottom - r.top - GetSystemMetrics( SM_CYCAPTION )) /
-            console->active->font.height;
+            max( console->active->font.height, 1 );
 
         InvalidateRect( console->win, NULL, FALSE );
         UpdateWindow( console->win );
@@ -884,7 +886,46 @@ static void set_first_font( struct console *console, struct console_config *conf
     fc.lf.lfHeight = config->cell_height;
     fc.lf.lfWidth = config->cell_width;
     if (!fc.weight || !set_console_font( console, &fc.lf ))
-        ERR("Unable to find a valid console font\n");
+        ERR( "Unable to find a valid console font\n" );
+
+    /* Whether or not the above reported success, console->active->font.width/
+     * height can still legitimately end up <= 0: no fonts enumerated at all
+     * (no font backend available at all in this build/environment) leaves
+     * font untouched (zeroed from console allocation), AND a "successfully"
+     * selected/created font can itself report degenerate (zero) metrics from
+     * GetTextMetricsW() under some environments (e.g. no usable GDI font
+     * backend to rasterize/measure against) even though CreateFontIndirectW()
+     * and set_console_font()'s own return value both indicate success. A
+     * large amount of code throughout this file divides by font.width/height
+     * (window sizing, cell/pixel conversion, caret and selection rendering,
+     * WM_SIZE handling, ...) with no zero-check anywhere, since a real
+     * Windows console can always rely on at least one real, correctly-
+     * measured fallback bitmap font existing. Previously neither case was
+     * guarded, leaving font.width/height at 0 (or whatever degenerate value
+     * GetTextMetricsW returned) and causing an unhandled division-by-zero
+     * the moment any such calculation ran (observed in practice: WM_SIZE's
+     * resize_window() call, which fires as part of normal window creation,
+     * not just on an interactive resize -- reliably crashing every single
+     * conhost-using process in this condition, not merely degrading font
+     * rendering). Fall back to a fixed, safe, non-zero cell size instead so
+     * every later consumer of font.width/height keeps working (with a
+     * visibly wrong/minimal font, admittedly, but functional rather than
+     * crashing), checking the ACTUAL resulting values rather than trusting
+     * the enumeration/creation call's own success/failure signal. */
+    if (console->active->font.width <= 0 || console->active->font.height <= 0)
+    {
+        ERR( "Console font width/height is degenerate (%dx%d), falling back to a fixed "
+             "size to avoid divide-by-zero in later font.width/height users\n",
+             console->active->font.width, console->active->font.height );
+        console->active->font.width  = 8;
+        console->active->font.height = 12;
+        console->active->font.weight = FW_NORMAL;
+        console->active->font.pitch_family = FIXED_PITCH | FF_MODERN;
+        free( console->active->font.face_name );
+        console->active->font.face_name = wcsdup( L"Fixedsys" );
+        console->active->font.face_len = console->active->font.face_name
+                ? wcslen( console->active->font.face_name ) : 0;
+    }
 
     /* Update active configuration */
     config->cell_width  = console->active->font.width;
@@ -2231,9 +2272,25 @@ static LRESULT WINAPI window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lp
 
     case WM_SIZE:
         if (console->window && console->window->update_state != UPDATE_BUSY)
+        {
+            /* console->active->font.width/height could, in practice, still
+             * be 0 here even with set_first_font()'s own fallback in place
+             * and even though create_screen_buffer() (conhost.c) now always
+             * initializes a freshly allocated screen buffer's font to a
+             * sane non-zero default: this is cheap, broad insurance against
+             * any other path that might leave a screen buffer's font
+             * degenerate, since WM_SIZE fires as part of ordinary window
+             * creation (not just interactive resize) and an unhandled
+             * division by zero here previously crashed every
+             * conhost-using process whenever no real font was available
+             * to measure. Clamp to 1 rather than trust font.width/height
+             * is already sane. */
+            int font_width = max( console->active->font.width, 1 );
+            int font_height = max( console->active->font.height, 1 );
             resize_window( console,
-                           max( LOWORD(lparam) / console->active->font.width, 20 ),
-                           max( HIWORD(lparam) / console->active->font.height, 20 ));
+                           max( LOWORD(lparam) / font_width, 20 ),
+                           max( HIWORD(lparam) / font_height, 20 ));
+        }
         break;
 
     case WM_HSCROLL:
