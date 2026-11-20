@@ -659,6 +659,70 @@ static void test_GetAbsolutePathName(void)
     RemoveDirectoryW(dir2);
 }
 
+static void test_put_Name(void)
+{
+    static const WCHAR dir1[] = L"test_rename_dir1";
+    static const WCHAR dir2[] = L"test_rename_dir2";
+    static const WCHAR file1[] = L"test_rename_file1.txt";
+    static const WCHAR file2[] = L"test_rename_file2.txt";
+    BSTR path, name;
+    IFolder *folder;
+    IFile *file;
+    HANDLE h;
+    HRESULT hr;
+
+    RemoveDirectoryW(dir1);
+    RemoveDirectoryW(dir2);
+    DeleteFileW(file1);
+    DeleteFileW(file2);
+
+    /* Folder. */
+    ok(CreateDirectoryW(dir1, NULL), "CreateDirectory failed, error %lu.\n", GetLastError());
+    path = SysAllocString(dir1);
+    hr = IFileSystem3_GetFolder(fs3, path, &folder);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    SysFreeString(path);
+
+    name = SysAllocString(dir2);
+    hr = IFolder_put_Name(folder, name);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    SysFreeString(name);
+    ok(GetFileAttributesW(dir1) == INVALID_FILE_ATTRIBUTES, "Old folder name still exists.\n");
+    ok(GetFileAttributesW(dir2) != INVALID_FILE_ATTRIBUTES, "New folder name does not exist.\n");
+
+    name = NULL;
+    hr = IFolder_get_Name(folder, &name);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(!lstrcmpW(name, dir2), "Unexpected name %s.\n", wine_dbgstr_w(name));
+    SysFreeString(name);
+    IFolder_Release(folder);
+    RemoveDirectoryW(dir2);
+
+    /* File. */
+    h = CreateFileW(file1, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    ok(h != INVALID_HANDLE_VALUE, "CreateFile failed, error %lu.\n", GetLastError());
+    CloseHandle(h);
+    path = SysAllocString(file1);
+    hr = IFileSystem3_GetFile(fs3, path, &file);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    SysFreeString(path);
+
+    name = SysAllocString(file2);
+    hr = IFile_put_Name(file, name);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    SysFreeString(name);
+    ok(GetFileAttributesW(file1) == INVALID_FILE_ATTRIBUTES, "Old file name still exists.\n");
+    ok(GetFileAttributesW(file2) != INVALID_FILE_ATTRIBUTES, "New file name does not exist.\n");
+
+    name = NULL;
+    hr = IFile_get_Name(file, &name);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(!lstrcmpW(name, file2), "Unexpected name %s.\n", wine_dbgstr_w(name));
+    SysFreeString(name);
+    IFile_Release(file);
+    DeleteFileW(file2);
+}
+
 static void test_GetFile(void)
 {
     BSTR path, str;
@@ -3478,6 +3542,7 @@ START_TEST(filesystem)
     test_GetBaseName();
     test_GetAbsolutePathName();
     test_GetFile();
+    test_put_Name();
     test_File_ParentFolder();
     test_File_ShortName();
     test_GetTempName();
