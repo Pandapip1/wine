@@ -4833,6 +4833,22 @@ static void test_FlushProcessWriteBuffers(void)
     ok( !reorderings, "expected sequential consistency with FlushProcessWriteBuffers (got %ld reorderings)\n", reorderings );
 }
 
+static void test_MapUserPhysicalPages(void)
+{
+    ULONG_PTR page = 0x12345678;
+    void *addr;
+
+    addr = VirtualAlloc( NULL, 0x10000, MEM_RESERVE, PAGE_READWRITE );
+    ok( !!addr, "VirtualAlloc failed, error %lu\n", GetLastError() );
+
+    /* A NULL page array means unmap, and the array is never written to. */
+    MapUserPhysicalPages( addr, 1, NULL );
+    MapUserPhysicalPages( addr, 1, &page );
+    ok( page == 0x12345678, "page array was modified: %Ix\n", page );
+
+    VirtualFree( addr, 0, MEM_RELEASE );
+}
+
 START_TEST(virtual)
 {
     int argc;
@@ -4921,6 +4937,7 @@ START_TEST(virtual)
     test_PrefetchVirtualMemory();
     test_ReadProcessMemory();
     test_FlushProcessWriteBuffers();
+    test_MapUserPhysicalPages();
 #if defined(__i386__) || defined(__x86_64__)
     test_stack_commit();
 #endif

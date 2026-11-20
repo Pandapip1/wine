@@ -1464,7 +1464,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH GlobalMemoryStatusEx( MEMORYSTATUSEX *status )
 BOOL WINAPI DECLSPEC_HOTPATCH MapUserPhysicalPages( void *addr, ULONG_PTR page_count, ULONG_PTR *pages )
 {
     FIXME( "stub: %p %Iu %p\n", addr, page_count, pages );
-    *pages = 0;
+    /* pages is an input array, and may be NULL to unmap the region. */
     SetLastError( ERROR_CALL_NOT_IMPLEMENTED );
     return FALSE;
 }
