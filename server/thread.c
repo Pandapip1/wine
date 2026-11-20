@@ -58,6 +58,7 @@
 #include "thread.h"
 #include "request.h"
 #include "user.h"
+#include "unicode.h"
 #include "security.h"
 
 
@@ -1141,6 +1142,27 @@ static int wait_on_handles( const union select_op *select_op, unsigned int count
     for (i = 0; i < count; i++)
         if (!(objects[i] = get_handle_obj( current->process, handles[i], SYNCHRONIZE, NULL )))
             break;
+
+    /* Diagnostic logging for the ROBOGUIDE/InstallShield early-wrapper-hang
+     * investigation: identify the type and (if any) full path name of every
+     * object a thread is about to block on, so a hang that shows only opaque
+     * handle values in a client-side WINEDEBUG=+sync trace can be matched
+     * back to a real kernel object. Gated on debug_level like every other
+     * server-side trace line, so it only prints under WINEDEBUG=+server. */
+    if (debug_level && i == count)
+    {
+        unsigned int j;
+        for (j = 0; j < count; j++)
+        {
+            struct object *obj = objects[j];
+            fprintf( stderr, "%04x: wait_on_handles: handle=%04x type=", current->id, handles[j] );
+            if (obj->ops->type) dump_strW( obj->ops->type->name.str, obj->ops->type->name.len, stderr, "\"\"" );
+            else fputs( "(no type)", stderr );
+            fputs( " name=", stderr );
+            if (obj->name) dump_object_name( obj ); else fputs( "(unnamed) ", stderr );
+            fputc( '\n', stderr );
+        }
+    }
 
     if (i == count) ret = wait_on( select_op, count, objects, flags, when );
 
