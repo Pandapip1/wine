@@ -451,12 +451,13 @@ static HRESULT create_local_service(REFCLSID rclsid)
          *        REG_MULTI_SZ here, but it's a REG_SZ for the services
          *        that I'm interested in for the moment.
          */
-        r = RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, NULL, &sz);
+        /* The value is named "ServiceParameters" on Windows. */
+        r = RegQueryValueExW(hkey, L"ServiceParameters", NULL, &type, NULL, &sz);
         if (r == ERROR_SUCCESS && type == REG_SZ && sz)
         {
             args[0] = calloc(1, sz);
             num_args++;
-            RegQueryValueExW(hkey, L"ServiceParams", NULL, &type, (LPBYTE)args[0], &sz);
+            RegQueryValueExW(hkey, L"ServiceParameters", NULL, &type, (LPBYTE)args[0], &sz);
         }
         r = start_local_service(buf, num_args, (LPCWSTR *)args);
         if (r != ERROR_SUCCESS)
