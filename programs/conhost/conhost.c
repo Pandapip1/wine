@@ -122,6 +122,23 @@ static struct screen_buffer *create_screen_buffer( struct console *console, int 
         screen_buffer->popup_attr  = 0xf5;
         screen_buffer->font.weight = FW_NORMAL;
         screen_buffer->font.pitch_family = FIXED_PITCH | FF_DONTCARE;
+        /* This is the first screen buffer created for this console (no
+         * predecessor to inherit font metrics from) -- set_first_font()
+         * will normally replace these with real measured metrics shortly
+         * after window creation, but it is only ever invoked once per
+         * console, not once per screen buffer. If console->active is
+         * later reset to NULL (destroy_screen_buffer(), e.g. when an app
+         * closes its active screen buffer) and a new one is created
+         * afterwards, THIS branch runs again for that new buffer and
+         * set_first_font() never revisits it, so width/height must not be
+         * left at their calloc()-zeroed value of 0: every later consumer
+         * (window sizing, WM_SIZE handling, cell/pixel conversion, caret
+         * and selection rendering, ...) divides by font.width/height with
+         * no zero-check, and a real Windows console can always rely on a
+         * sane bitmap fallback font existing. Match set_first_font()'s own
+         * fallback size so behavior is at least consistent. */
+        screen_buffer->font.width  = 8;
+        screen_buffer->font.height = 12;
     }
 
     if (wine_rb_put( &screen_buffer_map, LongToPtr(id), &screen_buffer->entry ))
