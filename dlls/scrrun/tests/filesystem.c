@@ -603,6 +603,14 @@ static void test_GetAbsolutePathName(void)
     ok(!lstrcmpiW(buf, result), "result = %s, expected %s\n", wine_dbgstr_w(result), wine_dbgstr_w(buf));
     SysFreeString(result);
 
+    /* An empty path resolves to the current directory, like NULL. */
+    path = SysAllocString(L"");
+    hr = IFileSystem3_GetAbsolutePathName(fs3, path, &result);
+    ok(hr == S_OK, "Unexpected hr %#lx.\n", hr);
+    ok(!lstrcmpiW(buf, result), "result = %s, expected %s\n", wine_dbgstr_w(result), wine_dbgstr_w(buf));
+    SysFreeString(result);
+    SysFreeString(path);
+
     find = FindFirstFileW(dir_match2, &fdata);
     if(find != INVALID_HANDLE_VALUE) {
         skip("GetAbsolutePathName tests\n");
