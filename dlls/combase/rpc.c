@@ -1248,6 +1248,20 @@ static HRESULT WINAPI ClientRpcChannelBuffer_GetBuffer(LPRPCCHANNELBUFFER iface,
         }
     }
     if (apt) apartment_release(apt);
+    else if (hr != S_OK && This->server_pid == GetCurrentProcessId())
+    {
+        /* The object lives in this process but its apartment no longer exists
+         * (e.g. it is being torn down from CoUninitialize() in another
+         * thread). Routing the call through the RPC runtime would need a new
+         * server thread, which may be unable to start (loader lock held by
+         * the thread tearing the apartment down) and would block forever. */
+        WARN("apartment for ipid %s is gone, hr %#lx\n", debugstr_guid(&ipid), hr);
+        free(channel_hook_data);
+        free(message_state);
+        free(cif);
+        msg->RpcInterfaceInformation = NULL;
+        return RPC_E_DISCONNECTED;
+    }
     message_state->params.handle = ClientRpcChannelBuffer_GetEventHandle(This);
     /* Note: message_state->params.msg is initialised in
      * ClientRpcChannelBuffer_SendReceive */
