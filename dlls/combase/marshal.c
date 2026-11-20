@@ -74,6 +74,12 @@ struct proxy_manager
     HANDLE remoting_mutex;    /* mutex used for synchronizing access to IRemUnknown */
     MSHCTX dest_context;      /* context used for activating optimisations (LOCK) */
     void *dest_context_data;  /* reserved context value (LOCK) */
+    struct                    /* security blanket set with IClientSecurity::SetBlanket (CS cs) */
+    {
+        DWORD authn_svc, authz_svc, authn_level, imp_level, capabilities;
+        WCHAR *principal;
+        void *auth_info;
+    } blanket;
 };
 
 static inline struct proxy_manager *impl_from_IMultiQI(IMultiQI *iface)
@@ -1351,6 +1357,44 @@ static ULONG WINAPI ProxyCliSec_Release(IClientSecurity *iface)
     return IMultiQI_Release(&This->IMultiQI_iface);
 }
 
+/* The interface pointers a blanket can be queried/set on: the proxied (remote) interfaces and the proxy's IUnknown.
+ * Interfaces implemented by the proxy manager itself (IMarshal, IClientSecurity, ...) are local: E_NOINTERFACE. */
+static HRESULT proxy_manager_check_blanket_interface(struct proxy_manager *This, IUnknown *proxy)
+{
+    struct ifproxy *ifproxy;
+    HRESULT hr = E_NOINTERFACE;
+
+    if (!proxy) return E_INVALIDARG;
+    if ((void *)proxy == (void *)&This->IMultiQI_iface) return S_OK;
+
+    EnterCriticalSection(&This->cs);
+    LIST_FOR_EACH_ENTRY(ifproxy, &This->interfaces, struct ifproxy, entry)
+    {
+        if (ifproxy->iface == (void *)proxy) { hr = S_OK; break; }
+    }
+    LeaveCriticalSection(&This->cs);
+    return hr;
+}
+
+static BOOL valid_authn_service(DWORD svc)
+{
+    switch (svc)
+    {
+    case RPC_C_AUTHN_NONE: case RPC_C_AUTHN_DCE_PRIVATE: case RPC_C_AUTHN_DCE_PUBLIC:
+    case RPC_C_AUTHN_DEC_PUBLIC: case RPC_C_AUTHN_GSS_NEGOTIATE: case RPC_C_AUTHN_WINNT:
+    case RPC_C_AUTHN_GSS_SCHANNEL: case RPC_C_AUTHN_GSS_KERBEROS: case RPC_C_AUTHN_DPA:
+    case RPC_C_AUTHN_MSN: case RPC_C_AUTHN_DIGEST: case RPC_C_AUTHN_MQ:
+    case 20: /* RPC_C_AUTHN_KERNEL */
+    case 30: /* RPC_C_AUTHN_NEGO_EXTENDER */
+    case 31: /* RPC_C_AUTHN_PKU2U */
+    case 32: /* RPC_C_AUTHN_LIVE_SSP */
+    case 35: /* RPC_C_AUTHN_LIVEXP_SSP */
+    case RPC_C_AUTHN_DEFAULT:
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static HRESULT WINAPI ProxyCliSec_QueryBlanket(IClientSecurity *iface,
                                                IUnknown *pProxy,
                                                DWORD *pAuthnSvc,
@@ -1361,26 +1405,34 @@ static HRESULT WINAPI ProxyCliSec_QueryBlanket(IClientSecurity *iface,
                                                void **pAuthInfo,
                                                DWORD *pCapabilities)
 {
-    FIXME("(%p, %p, %p, %p, %p, %p, %p, %p): stub\n", pProxy, pAuthnSvc,
-          pAuthzSvc, ppServerPrincName, pAuthnLevel, pImpLevel, pAuthInfo,
-          pCapabilities);
+    struct proxy_manager *This = impl_from_IClientSecurity( iface );
+    HRESULT hr;
 
-    if (pAuthnSvc)
-        *pAuthnSvc = 0;
-    if (pAuthzSvc)
-        *pAuthzSvc = 0;
+    TRACE("%p, %p, %p, %p, %p, %p, %p, %p, %p\n", iface, pProxy, pAuthnSvc, pAuthzSvc, ppServerPrincName,
+          pAuthnLevel, pImpLevel, pAuthInfo, pCapabilities);
+
+    if (FAILED(hr = proxy_manager_check_blanket_interface(This, pProxy))) return hr;
+
+    EnterCriticalSection(&This->cs);
+    if (pAuthnSvc) *pAuthnSvc = This->blanket.authn_svc;
+    if (pAuthzSvc) *pAuthzSvc = This->blanket.authz_svc;
     if (ppServerPrincName)
+    {
         *ppServerPrincName = NULL;
-    if (pAuthnLevel)
-        *pAuthnLevel = RPC_C_AUTHN_LEVEL_DEFAULT;
-    if (pImpLevel)
-        *pImpLevel = RPC_C_IMP_LEVEL_DEFAULT;
-    if (pAuthInfo)
-        *pAuthInfo = NULL;
-    if (pCapabilities)
-        *pCapabilities = EOAC_NONE;
+        if (This->blanket.principal)
+        {
+            SIZE_T size = (wcslen(This->blanket.principal) + 1) * sizeof(WCHAR);
+            if ((*ppServerPrincName = CoTaskMemAlloc(size))) memcpy(*ppServerPrincName, This->blanket.principal, size);
+            else hr = E_OUTOFMEMORY;
+        }
+    }
+    if (pAuthnLevel) *pAuthnLevel = This->blanket.authn_level;
+    if (pImpLevel) *pImpLevel = This->blanket.imp_level;
+    if (pAuthInfo) *pAuthInfo = This->blanket.auth_info;
+    if (pCapabilities) *pCapabilities = This->blanket.capabilities;
+    LeaveCriticalSection(&This->cs);
 
-    return E_NOTIMPL;
+    return hr;
 }
 
 static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
@@ -1391,10 +1443,35 @@ static HRESULT WINAPI ProxyCliSec_SetBlanket(IClientSecurity *iface,
                                              void *pAuthInfo,
                                              DWORD Capabilities)
 {
-    FIXME("%p, %ld, %ld, %s, %ld, %ld, %p, %#lx: stub\n", pProxy, AuthnSvc, AuthzSvc,
+    struct proxy_manager *This = impl_from_IClientSecurity( iface );
+    WCHAR *principal = NULL;
+    HRESULT hr;
+
+    TRACE("%p, %p, %ld, %ld, %s, %ld, %ld, %p, %#lx\n", iface, pProxy, AuthnSvc, AuthzSvc,
           pServerPrincName == COLE_DEFAULT_PRINCIPAL ? "<default principal>" : debugstr_w(pServerPrincName),
           AuthnLevel, ImpLevel, pAuthInfo, Capabilities);
-    return E_NOTIMPL;
+
+    if (FAILED(hr = proxy_manager_check_blanket_interface(This, pProxy))) return hr;
+    if (!valid_authn_service(AuthnSvc)) return E_INVALIDARG;
+
+    /* The blanket is only recorded: calls to local servers are not authenticated by this implementation. */
+    if (pServerPrincName && pServerPrincName != COLE_DEFAULT_PRINCIPAL)
+    {
+        if (!(principal = wcsdup(pServerPrincName))) return E_OUTOFMEMORY;
+    }
+
+    EnterCriticalSection(&This->cs);
+    free(This->blanket.principal);
+    This->blanket.principal = principal;
+    if (AuthnSvc != RPC_C_AUTHN_DEFAULT) This->blanket.authn_svc = AuthnSvc;
+    if (AuthzSvc != RPC_C_AUTHZ_DEFAULT) This->blanket.authz_svc = AuthzSvc;
+    if (AuthnLevel != RPC_C_AUTHN_LEVEL_DEFAULT) This->blanket.authn_level = AuthnLevel;
+    if (ImpLevel != RPC_C_IMP_LEVEL_DEFAULT) This->blanket.imp_level = ImpLevel;
+    This->blanket.auth_info = pAuthInfo;
+    This->blanket.capabilities = Capabilities;
+    LeaveCriticalSection(&This->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ProxyCliSec_CopyProxy(IClientSecurity *iface,
@@ -1563,6 +1640,13 @@ static HRESULT proxy_manager_construct(
     This->IMultiQI_iface.lpVtbl = &ClientIdentity_Vtbl;
     This->IMarshal_iface.lpVtbl = &ProxyMarshal_Vtbl;
     This->IClientSecurity_iface.lpVtbl = &ProxyCliSec_Vtbl;
+    This->blanket.authn_svc = RPC_C_AUTHN_WINNT;
+    This->blanket.authz_svc = RPC_C_AUTHZ_NONE;
+    This->blanket.authn_level = RPC_C_AUTHN_LEVEL_CONNECT;
+    This->blanket.imp_level = RPC_C_IMP_LEVEL_IDENTIFY;
+    This->blanket.capabilities = EOAC_NONE;
+    This->blanket.principal = NULL;
+    This->blanket.auth_info = NULL;
 
     list_init(&This->entry);
     list_init(&This->interfaces);
@@ -1943,6 +2027,7 @@ static void proxy_manager_destroy(struct proxy_manager * This)
     }
 
     if (This->remunk) IRemUnknown_Release(This->remunk);
+    free(This->blanket.principal);
     CoTaskMemFree(This->oxid_info.psa);
 
     This->cs.DebugInfo->Spare[0] = 0;
