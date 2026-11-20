@@ -49,6 +49,14 @@ struct win_class_vtbl {
     HRESULT (*get_kbd_shortcut)(Client*, VARIANT, BSTR*);
     HRESULT (*get_value)(Client*, VARIANT, BSTR*);
     HRESULT (*put_value)(Client*, VARIANT, BSTR);
+    /* Added to support controls (e.g. SysTreeView32) whose "children" are
+     * virtual items, not real child HWNDs, so the default accChildCount
+     * (which counts real child windows via GetWindow(GW_CHILD)) always
+     * reports 0 for them. When set, this overrides that count; get_name/
+     * get_state above are then expected to handle non-CHILDID_SELF ids
+     * (simple integer child ids) by mapping them to the control's own
+     * virtual items, in addition to their existing CHILDID_SELF handling. */
+    HRESULT (*get_child_count)(Client*, LONG*);
 };
 
 static HRESULT win_get_name(HWND hwnd, BSTR *name)
@@ -199,6 +207,10 @@ static HRESULT WINAPI Client_get_accChildCount(IAccessible *iface, LONG *pcountC
     TRACE("(%p)->(%p)\n", This, pcountChildren);
 
     *pcountChildren = 0;
+
+    if(This->vtbl && This->vtbl->get_child_count)
+        return This->vtbl->get_child_count(This, pcountChildren);
+
     for(cur = GetWindow(This->hwnd, GW_CHILD); cur; cur = GetWindow(cur, GW_HWNDNEXT))
         (*pcountChildren)++;
 
@@ -868,6 +880,202 @@ static const win_class_vtbl edit_vtbl = {
     edit_put_value,
 };
 
+/* SysTreeView32 (WC_TREEVIEWW) accessibility support.
+ *
+ * Unlike simple controls (Button, Static, ...), a treeview's items are not
+ * real child HWNDs -- they are virtual, identified only by HTREEITEM handles
+ * internal to the control -- so the generic Client code (which enumerates
+ * real child windows for accChildCount, and never produces non-CHILDID_SELF
+ * ids at all) always reported 0 children for treeviews, with no way for an
+ * accessibility client (e.g. a screen reader, or any IAccessible consumer)
+ * to read item text or checkbox/selection state. This implements that by:
+ *   - get_child_count: TVM_GETCOUNT (total item count, all levels, plain
+ *     integer result -- no cross-process marshaling concerns).
+ *   - treeview_item_from_index: maps a 1-based flat child id to its
+ *     HTREEITEM via a depth-first (root, then children-before-siblings)
+ *     walk using TVM_GETNEXTITEM (TVGN_ROOT/TVGN_CHILD/TVGN_NEXT), all of
+ *     which only exchange plain HTREEITEM handle values, not pointers, so
+ *     again no marshaling is needed for the walk itself.
+ *   - get_name/get_state: for non-SELF ids, resolve the item via the above,
+ *     then use treeview_get_item_remote() to read its text and state.
+ *     TVM_GETITEMW's TVITEMW struct contains a pszText pointer, which must
+ *     be valid in the TARGET process (the treeview's owning process, which
+ *     may be a different process than the caller's -- e.g. an accessibility
+ *     client inspecting another application's window). Windows itself
+ *     transparently marshals a handful of known common-control messages
+ *     with embedded pointers (including TVM_/LVM_ GETITEM) across process
+ *     boundaries inside SendMessage; Wine's message-passing core does not
+ *     replicate that, so this does the equivalent marshaling explicitly:
+ *     open the target process, allocate a remote buffer for both the
+ *     TVITEMW struct and its text buffer, write the request, send the
+ *     message, then read the result (including the text) back.
+ */
+
+static BOOL treeview_get_item_remote(HWND hwnd, HTREEITEM item, WCHAR *text_out,
+        int text_out_len, UINT *state_out)
+{
+    DWORD pid;
+    HANDLE proc;
+    BYTE *remote_buf;
+    TVITEMW local_item, result_item;
+    SIZE_T text_bytes = (SIZE_T)text_out_len * sizeof(WCHAR);
+    BOOL ret = FALSE;
+
+    if(!GetWindowThreadProcessId(hwnd, &pid))
+        return FALSE;
+
+    proc = OpenProcess(PROCESS_VM_OPERATION|PROCESS_VM_READ|PROCESS_VM_WRITE, FALSE, pid);
+    if(!proc)
+        return FALSE;
+
+    remote_buf = VirtualAllocEx(proc, NULL, sizeof(TVITEMW) + text_bytes,
+            MEM_COMMIT, PAGE_READWRITE);
+    if(!remote_buf) {
+        CloseHandle(proc);
+        return FALSE;
+    }
+
+    memset(&local_item, 0, sizeof(local_item));
+    local_item.mask = TVIF_TEXT | TVIF_HANDLE;
+    local_item.hItem = item;
+    local_item.pszText = (LPWSTR)(remote_buf + sizeof(TVITEMW));
+    local_item.cchTextMax = text_out_len;
+
+    if(WriteProcessMemory(proc, remote_buf, &local_item, sizeof(local_item), NULL) &&
+            SendMessageW(hwnd, TVM_GETITEMW, 0, (LPARAM)remote_buf) &&
+            ReadProcessMemory(proc, remote_buf, &result_item, sizeof(result_item), NULL) &&
+            ReadProcessMemory(proc, remote_buf + sizeof(TVITEMW), text_out, text_bytes, NULL)) {
+        ret = TRUE;
+    }
+
+    if(ret) {
+        memset(&local_item, 0, sizeof(local_item));
+        local_item.mask = TVIF_STATE | TVIF_HANDLE;
+        local_item.hItem = item;
+        local_item.state = 0;
+        local_item.stateMask = TVIS_STATEIMAGEMASK | TVIS_SELECTED | TVIS_EXPANDED;
+
+        ret = FALSE;
+        if(WriteProcessMemory(proc, remote_buf, &local_item, sizeof(local_item), NULL) &&
+                SendMessageW(hwnd, TVM_GETITEMW, 0, (LPARAM)remote_buf) &&
+                ReadProcessMemory(proc, remote_buf, &result_item, sizeof(result_item), NULL)) {
+            *state_out = result_item.state;
+            ret = TRUE;
+        }
+    }
+
+    VirtualFreeEx(proc, remote_buf, 0, MEM_RELEASE);
+    CloseHandle(proc);
+    return ret;
+}
+
+static HTREEITEM treeview_walk_depth_first(HWND hwnd, HTREEITEM item, LONG *count, LONG target)
+{
+    while(item) {
+        HTREEITEM child, found;
+
+        (*count)++;
+        if(*count == target)
+            return item;
+
+        child = (HTREEITEM)SendMessageW(hwnd, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)item);
+        if(child) {
+            found = treeview_walk_depth_first(hwnd, child, count, target);
+            if(found)
+                return found;
+        }
+
+        item = (HTREEITEM)SendMessageW(hwnd, TVM_GETNEXTITEM, TVGN_NEXT, (LPARAM)item);
+    }
+    return NULL;
+}
+
+static HTREEITEM treeview_item_from_index(HWND hwnd, LONG target_index)
+{
+    HTREEITEM root = (HTREEITEM)SendMessageW(hwnd, TVM_GETNEXTITEM, TVGN_ROOT, 0);
+    LONG count = 0;
+    return treeview_walk_depth_first(hwnd, root, &count, target_index);
+}
+
+static HRESULT treeview_get_child_count(Client *client, LONG *count)
+{
+    *count = SendMessageW(client->hwnd, TVM_GETCOUNT, 0, 0);
+    return S_OK;
+}
+
+static HRESULT treeview_get_name(Client *client, VARIANT id, BSTR *name)
+{
+    HTREEITEM item;
+    WCHAR buf[512];
+    UINT state;
+    int idx;
+
+    *name = NULL;
+    idx = convert_child_id(&id);
+    if(idx == CHILDID_SELF)
+        return win_get_name(client->hwnd, name);
+
+    if(!IsWindow(client->hwnd))
+        return E_INVALIDARG;
+
+    item = treeview_item_from_index(client->hwnd, idx);
+    if(!item)
+        return E_INVALIDARG;
+
+    if(!treeview_get_item_remote(client->hwnd, item, buf, ARRAY_SIZE(buf), &state))
+        return S_FALSE;
+
+    *name = SysAllocString(buf);
+    return *name ? S_OK : E_OUTOFMEMORY;
+}
+
+static HRESULT treeview_get_state(Client *client, VARIANT id, VARIANT *state_out)
+{
+    HTREEITEM item;
+    WCHAR buf[512];
+    UINT state;
+    int idx;
+
+    idx = convert_child_id(&id);
+    if(idx == CHILDID_SELF)
+        return client_get_state(client, id, state_out);
+
+    V_VT(state_out) = VT_I4;
+    V_I4(state_out) = 0;
+
+    if(!IsWindow(client->hwnd))
+        return E_INVALIDARG;
+
+    item = treeview_item_from_index(client->hwnd, idx);
+    if(!item)
+        return E_INVALIDARG;
+
+    if(!treeview_get_item_remote(client->hwnd, item, buf, ARRAY_SIZE(buf), &state))
+        return S_FALSE;
+
+    V_I4(state_out) |= STATE_SYSTEM_SELECTABLE | STATE_SYSTEM_FOCUSABLE;
+    if(state & TVIS_SELECTED)
+        V_I4(state_out) |= STATE_SYSTEM_SELECTED | STATE_SYSTEM_FOCUSED;
+    if(state & TVIS_EXPANDED)
+        V_I4(state_out) |= STATE_SYSTEM_EXPANDED;
+    /* Checkbox state image index: 1=unchecked, 2=checked
+     * (see INDEXTOSTATEIMAGEMASK / TVS_CHECKBOXES convention). */
+    if(((state & TVIS_STATEIMAGEMASK) >> 12) == 2)
+        V_I4(state_out) |= STATE_SYSTEM_CHECKED;
+
+    return S_OK;
+}
+
+static const win_class_vtbl treeview_vtbl = {
+    NULL,
+    treeview_get_state,
+    treeview_get_name,
+    NULL,
+    NULL,
+    NULL,
+    treeview_get_child_count,
+};
+
 static const struct win_class_data classes[] = {
     {WC_LISTBOXW,           0x10000, TRUE},
     {L"#32768",             0x10001, TRUE}, /* menu */
@@ -891,7 +1099,7 @@ static const struct win_class_data classes[] = {
     {WC_LISTVIEWW,          0x10013, TRUE},
     {UPDOWN_CLASSW,         0x10016, TRUE},
     {TOOLTIPS_CLASSW,       0x10018, TRUE},
-    {WC_TREEVIEWW,          0x10019, TRUE},
+    {WC_TREEVIEWW,          0x10019, FALSE, &treeview_vtbl},
     {DATETIMEPICK_CLASSW,   0, TRUE},
     {WC_IPADDRESSW,         0, TRUE},
     {L"RICHEDIT",           0x1001c, TRUE},
