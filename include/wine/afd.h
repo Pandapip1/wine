@@ -38,6 +38,12 @@ struct afd_wsabuf_32
 #endif
 
 #define IOCTL_AFD_BIND                      CTL_CODE(FILE_DEVICE_BEEP, 0x800, METHOD_NEITHER,  FILE_ANY_ACCESS)
+/* The real (non-Wine-invented) AFD connect ioctl. Its numeric value matches
+ * AFD_CONTROL_CODE(AFD_CONNECT, METHOD_NEITHER) from ReactOS's
+ * sdk/include/reactos/drivers/afd/shared.h (AFD_CONNECT == operation 1,
+ * immediately after AFD_BIND == operation 0), which is independent evidence
+ * this is really operation 1 in the same numbering family as IOCTL_AFD_BIND. */
+#define IOCTL_AFD_CONNECT                   CTL_CODE(FILE_DEVICE_BEEP, 0x801, METHOD_NEITHER,  FILE_ANY_ACCESS)
 #define IOCTL_AFD_LISTEN                    CTL_CODE(FILE_DEVICE_BEEP, 0x802, METHOD_NEITHER,  FILE_ANY_ACCESS)
 #define IOCTL_AFD_RECV                      CTL_CODE(FILE_DEVICE_BEEP, 0x805, METHOD_NEITHER,  FILE_ANY_ACCESS)
 #define IOCTL_AFD_POLL                      CTL_CODE(FILE_DEVICE_BEEP, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -83,6 +89,30 @@ struct afd_bind_params
     struct WS(sockaddr) addr; /* variable size */
 };
 C_ASSERT( sizeof(struct afd_bind_params) == 20 );
+
+/* Wire format of AFD_CONNECT_INFO (ReactOS shared.h) followed by a
+ * TRANSPORT_ADDRESS containing exactly one TA_ADDRESS. This is ReactOS's
+ * reimplementation of the real, undocumented AFD connect ioctl input; it has
+ * not been verified against real Windows. Only TDI_ADDRESS_TYPE_IP (AF_INET)
+ * and TDI_ADDRESS_TYPE_IP6 (AF_INET6) are handled; TDI_ADDRESS_IP/IP6 are
+ * byte-packed (see ReactOS tdi.h, wrapped in pshpack1.h) and are byte-for-byte
+ * struct sockaddr_in/sockaddr_in6 minus the leading 2-byte sa_family/sin6_len
+ * field, since the family is instead carried out-of-band in addr_type below. */
+struct afd_connect_info_params
+{
+    BOOLEAN use_san;
+    UINT root;
+    UINT unknown;
+    /* immediately followed by:
+     *   LONG addr_count;    -- TRANSPORT_ADDRESS.TAAddressCount, must be 1
+     *   USHORT addr_len;    -- TA_ADDRESS.AddressLength
+     *   USHORT addr_type;   -- TA_ADDRESS.AddressType (TDI_ADDRESS_TYPE_IP == 2, _IP6 == 23)
+     *   BYTE addr[];        -- TDI_ADDRESS_IP or TDI_ADDRESS_IP6, addr_len bytes
+     */
+};
+
+#define TDI_ADDRESS_TYPE_IP     2
+#define TDI_ADDRESS_TYPE_IP6    23
 
 struct afd_listen_params
 {
